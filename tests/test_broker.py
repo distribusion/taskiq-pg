@@ -9,6 +9,11 @@ from taskiq import AckableMessage, BrokerMessage
 from taskiq.utils import maybe_awaitable
 
 from taskiq_pg import AsyncpgBroker
+from taskiq_pg.broker_queries import (
+    COMPLETE_MESSAGE_QUERY,
+    DEQUEUE_MESSAGE_QUERY,
+    HEARTBEAT_MESSAGES_QUERY,
+)
 
 
 async def get_first_task(asyncpg_broker: AsyncpgBroker) -> AckableMessage:
@@ -280,3 +285,313 @@ async def test_message_ttl(asyncpg_broker: AsyncpgBroker) -> None:
     assert row is not None
     assert row["status"] == "completed"
     assert row["expire_at"] is not None
+
+
+@pytest.mark.anyio
+async def test_dequeue_stamps_heartbeat(asyncpg_broker: AsyncpgBroker) -> None:
+    """Claiming a message must set status=active and stamp heartbeat_at."""
+    tbl = asyncpg_broker.table_name
+    sent = BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name="test_task",
+        message=b"hb",
+        labels={},
+    )
+    await asyncpg_broker.kick(sent)
+    message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    row = await conn.fetchrow(
+        f"SELECT status, heartbeat_at FROM {tbl} WHERE task_id = $1",  # noqa: S608
+        sent.task_id,
+    )
+    await conn.close()
+    assert row is not None
+    assert row["status"] == "active"
+    assert row["heartbeat_at"] is not None
+    await maybe_awaitable(message.ack())
+
+
+async def _insert_active(
+    conn: "asyncpg.Connection[asyncpg.Record]",
+    tbl: str,
+    name: str,
+    heartbeat_sql: str,
+) -> int:
+    """Insert an active row with explicit heartbeat_at; return its id."""
+    return int(
+        await conn.fetchval(
+            f"INSERT INTO {tbl} "  # noqa: S608
+            "(task_id, task_name, message, labels, status, heartbeat_at) "
+            f"VALUES ($1, $2, 'x', '{{}}'::jsonb, 'active', {heartbeat_sql}) "
+            "RETURNING id",
+            uuid.uuid4().hex,
+            name,
+        )
+    )
+
+
+@pytest.mark.anyio
+async def test_sweep_reclaims_stale_lease(asyncpg_broker: AsyncpgBroker) -> None:
+    """Sweep requeues active rows with a stale heartbeat and bumps retry_count."""
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    stale_id = await _insert_active(conn, tbl, "stale", "NOW() - INTERVAL '10 seconds'")
+    fresh_id = await _insert_active(conn, tbl, "fresh", "NOW()")
+
+    await asyncpg_broker._sweep_stuck_messages()
+
+    stale = await conn.fetchrow(
+        f"SELECT status, retry_count FROM {tbl} WHERE id = $1",  # noqa: S608
+        stale_id,
+    )
+    fresh = await conn.fetchrow(
+        f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
+        fresh_id,
+    )
+    await conn.close()
+    assert stale is not None and stale["status"] == "queued"
+    assert stale["retry_count"] == 1
+    assert fresh is not None and fresh["status"] == "active"
+
+
+@pytest.mark.anyio
+async def test_heartbeat_refreshes_inflight(asyncpg_broker: AsyncpgBroker) -> None:
+    """Heartbeat query advances heartbeat_at only for active in-flight ids."""
+    tbl = asyncpg_broker.table_name
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    msg_id = await _insert_active(conn, tbl, "t", "NOW() - INTERVAL '10 seconds'")
+
+    assert asyncpg_broker.write_pool is not None
+    await asyncpg_broker.write_pool.execute(
+        HEARTBEAT_MESSAGES_QUERY.format(table_name=asyncpg_broker.table_name),
+        [msg_id],
+    )
+    fresh = await conn.fetchval(
+        f"SELECT heartbeat_at > NOW() - INTERVAL '2 seconds' "  # noqa: S608
+        f"FROM {tbl} WHERE id = $1",
+        msg_id,
+    )
+    await conn.close()
+    assert fresh is True
+
+
+@pytest.mark.anyio
+async def test_kick_leaves_expire_at_null_until_ack(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """TTL is applied at completion, not at insert: expire_at is NULL while queued."""
+    tbl = asyncpg_broker.table_name
+    sent = BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name="t",
+        message=b"x",
+        labels={"ttl": 5},
+    )
+    await asyncpg_broker.kick(sent)
+
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    before = await conn.fetchrow(
+        f"SELECT status, expire_at FROM {tbl} WHERE task_id = $1",  # noqa: S608
+        sent.task_id,
+    )
+    assert before is not None
+    assert before["status"] == "queued"
+    assert before["expire_at"] is None  # not stamped at insert
+
+    message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+    await maybe_awaitable(message.ack())
+
+    after = await conn.fetchrow(
+        f"SELECT status, expire_at FROM {tbl} WHERE task_id = $1",  # noqa: S608
+        sent.task_id,
+    )
+    await conn.close()
+    assert after is not None
+    assert after["status"] == "completed"
+    assert after["expire_at"] is not None  # stamped at completion
+
+
+@pytest.mark.anyio
+async def test_null_heartbeat_active_row_not_swept(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """Mixed-rollout safety: legacy active rows (NULL heartbeat) survive sweep."""
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    row_id = await _insert_active(conn, tbl, "legacy", "NULL")
+
+    await asyncpg_broker._sweep_stuck_messages()
+
+    row = await conn.fetchrow(
+        f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
+        row_id,
+    )
+    await conn.close()
+    assert row is not None
+    assert row["status"] == "active"  # NULL < threshold is false -> left alone
+
+
+@pytest.mark.anyio
+async def test_retry_count_increments_across_reclaims(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """Each stale-lease reclaim bumps retry_count."""
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    row_id = await _insert_active(conn, tbl, "flaky", "NOW() - INTERVAL '10 seconds'")
+
+    async def sweep_then_stale() -> None:
+        await asyncpg_broker._sweep_stuck_messages()
+        # re-arm as a stale active row to simulate another dead claim
+        await conn.execute(
+            f"UPDATE {tbl} SET status = 'active', "  # noqa: S608
+            "heartbeat_at = NOW() - INTERVAL '10 seconds' WHERE id = $1",
+            row_id,
+        )
+
+    await sweep_then_stale()
+    await sweep_then_stale()
+    await asyncpg_broker._sweep_stuck_messages()
+
+    retry = await conn.fetchval(
+        f"SELECT retry_count FROM {tbl} WHERE id = $1",  # noqa: S608
+        row_id,
+    )
+    await conn.close()
+    assert retry == 3
+
+
+@pytest.mark.anyio
+async def test_heartbeat_prevents_reclaim_of_live_claim(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """Fresh-heartbeat claim survives sweep; a stale one is reclaimed.
+
+    Mirrors the bench liveness scenario without a real worker process.
+    """
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    await asyncpg_broker.kick(
+        BrokerMessage(task_id=uuid.uuid4().hex, task_name="t", message=b"x", labels={})
+    )
+    claimed = await asyncpg_broker._dequeue_message()  # sets active + heartbeat=NOW()
+    assert claimed is not None
+    mid = claimed["id"]
+
+    # Fresh lease -> not reclaimed even with a 1s timeout.
+    await asyncpg_broker._sweep_stuck_messages()
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    still = await conn.fetchval(
+        f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
+        mid,
+    )
+    assert still == "active"
+
+    # Age the lease past the timeout -> reclaimed.
+    await conn.execute(
+        f"UPDATE {tbl} SET heartbeat_at = NOW() - INTERVAL '10 seconds' "  # noqa: S608
+        "WHERE id = $1",
+        mid,
+    )
+    await asyncpg_broker._sweep_stuck_messages()
+    reclaimed = await conn.fetchrow(
+        f"SELECT status, retry_count FROM {tbl} WHERE id = $1",  # noqa: S608
+        mid,
+    )
+    await conn.close()
+    assert reclaimed is not None
+    assert reclaimed["status"] == "queued"
+    assert reclaimed["retry_count"] == 1
+
+
+@pytest.mark.anyio
+async def test_dead_worker_reclaim_and_reprocess(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """End-to-end reclaim: claim -> die -> sweep requeues -> re-claim -> complete."""
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    await asyncpg_broker.kick(
+        BrokerMessage(task_id=uuid.uuid4().hex, task_name="t", message=b"x", labels={})
+    )
+
+    first = await asyncpg_broker._dequeue_message()  # worker A claims
+    assert first is not None
+    mid = first["id"]
+
+    # Worker A dies mid-flight: freeze/age its heartbeat, never acks.
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    await conn.execute(
+        f"UPDATE {tbl} SET heartbeat_at = NOW() - INTERVAL '10 seconds' "  # noqa: S608
+        "WHERE id = $1",
+        mid,
+    )
+
+    await asyncpg_broker._sweep_stuck_messages()  # sweeper requeues it
+    requeued = await conn.fetchrow(
+        f"SELECT status, retry_count FROM {tbl} WHERE id = $1",  # noqa: S608
+        mid,
+    )
+    assert requeued is not None
+    assert requeued["status"] == "queued"
+    assert requeued["retry_count"] == 1
+
+    second = await asyncpg_broker._dequeue_message()  # worker B re-claims same id
+    assert second is not None
+    assert second["id"] == mid
+
+    assert asyncpg_broker.write_pool is not None
+    _ = await asyncpg_broker.write_pool.execute(
+        COMPLETE_MESSAGE_QUERY.format(table_name=tbl), asyncpg_broker.message_ttl, mid
+    )
+    final = await conn.fetchval(
+        f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
+        mid,
+    )
+    await conn.close()
+    assert final == "completed"
+
+
+@pytest.mark.anyio
+async def test_concurrent_claim_exclusivity(asyncpg_broker: AsyncpgBroker) -> None:
+    """Two competing consumers claim a shared backlog with no double-claim, no loss.
+
+    Mirrors the multi-worker bench: FOR UPDATE SKIP LOCKED must hand each message
+    to exactly one consumer.
+    """
+    tbl = asyncpg_broker.table_name
+    backlog = 60
+    for _ in range(backlog):
+        await asyncpg_broker.kick(
+            BrokerMessage(
+                task_id=uuid.uuid4().hex, task_name="t", message=b"x", labels={}
+            )
+        )
+
+    dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
+
+    async def drain(claimed: list[int]) -> None:
+        conn = await asyncpg.connect(asyncpg_broker.dsn)
+        try:
+            while True:
+                async with conn.transaction():
+                    row = await conn.fetchrow(dequeue_sql)
+                if row is None:
+                    return
+                claimed.append(int(row["id"]))
+                await asyncio.sleep(0)  # yield so the two drainers interleave
+        finally:
+            await conn.close()
+
+    a: list[int] = []
+    b: list[int] = []
+    await asyncio.gather(drain(a), drain(b))
+
+    all_ids = a + b
+    assert len(all_ids) == backlog  # nothing lost
+    assert len(set(all_ids)) == backlog  # nothing claimed twice
+    assert a and b  # both consumers actually did work
