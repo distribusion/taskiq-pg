@@ -297,16 +297,18 @@ class AsyncpgBroker(AsyncBroker):
                 async def ack(
                     *, _message_id: int = message_id, _ttl: int = resolved_ttl
                 ) -> None:
-                    self._inflight_ids.discard(_message_id)
                     if self.write_pool is None:
                         raise ValueError("Call startup before starting listening.")
 
+                    # Keep the lease refreshed until completion lands; discarding
+                    # early lets the sweeper reclaim a mid-ack row -> dup work.
                     async with self.write_pool.acquire() as conn:
                         _ = await conn.execute(
                             COMPLETE_MESSAGE_QUERY.format(table_name=self.table_name),
                             _ttl,
                             _message_id,
                         )
+                    self._inflight_ids.discard(_message_id)
 
                 yield AckableMessage(data=message_data, ack=ack)
             except Exception as e:

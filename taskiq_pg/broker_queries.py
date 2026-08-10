@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from taskiq_pg.status import MessageStatus
 
-# Additive DDL: base table + idempotent ALTERs so legacy tables upgrade in place.
+# Additive DDL: base table + idempotent ALTERs so a legacy (master) table gains
+# every new column in place before the indexes below reference them.
 # lock_key stays vestigial (old advisory-lock workers still read it during rollout).
 CREATE_TABLE_QUERY = f"""
 CREATE TABLE IF NOT EXISTS {{table_name}} (
@@ -22,6 +23,12 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
     retry_count INTEGER DEFAULT 0,
     heartbeat_at TIMESTAMP WITH TIME ZONE
 );
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}' CHECK (status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.COMPLETED.value}'));
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS lock_key SERIAL NOT NULL;
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';
