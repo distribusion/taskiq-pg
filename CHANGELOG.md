@@ -4,7 +4,7 @@
 
 ### Features
 
-* Add PostgreSQL advisory locking for preventing duplicate message processing
+* Add atomic message claiming via `FOR UPDATE SKIP LOCKED` to prevent duplicate processing
 * Add message states (queued, active, completed) for better tracking
 * Add group-based job coordination to prevent concurrent execution of related tasks
 * Add message TTL support for automatic cleanup of completed messages

@@ -139,7 +139,7 @@ select convert_from(result, 'UTF8') from taskiq_results;
 - `max_retry_attempts`: Maximum number of message processing attempts.
 - `connection_kwargs`: Additional arguments for asyncpg connection.
 - `pool_kwargs`: Additional arguments for asyncpg pool creation.
-- `job_lock_keyspace`: Advisory lock keyspace for jobs (default: 1).
+- `job_lock_keyspace`: Deprecated/vestigial. No longer used (claiming is via `FOR UPDATE SKIP LOCKED`); kept only for constructor compatibility.
 - `message_ttl`: Time to live for completed messages in seconds (default: 86400).
 - `stuck_message_timeout`: Time before message is considered stuck in seconds (default: 300).
 - `enable_sweeping`: Enable automatic cleanup of stuck messages (default: True).
@@ -147,8 +147,8 @@ select convert_from(result, 'UTF8') from taskiq_results;
 
 ## Enhanced Features
 
-### Advisory Locking
-The broker now uses PostgreSQL advisory locks to prevent duplicate message processing. Each message gets a unique lock that is held while the message is being processed and released when acknowledged.
+### Atomic Message Claiming
+The broker claims each message atomically with `SELECT ... FOR UPDATE SKIP LOCKED`, so competing workers never grab the same row. An in-flight message keeps a heartbeat lease; if a worker dies, the sweeper reclaims the stale lease and re-queues the message.
 
 ### Message States
 Messages now have three states:

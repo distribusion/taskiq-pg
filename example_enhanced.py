@@ -1,5 +1,5 @@
 """
-Example demonstrating the enhanced features of taskiq-pg with advisory locking, group coordination, and automatic cleanup.
+Example demonstrating the enhanced features of taskiq-pg with atomic message claiming (FOR UPDATE SKIP LOCKED), group coordination, and automatic cleanup.
 
 **shell 1: start a worker**
 
@@ -60,7 +60,7 @@ asyncpg_result_backend = AsyncpgResultBackend[object](
 # Initialize broker with enhanced features
 broker = AsyncpgBroker(
     dsn=dsn,
-    job_lock_keyspace=1,  # Advisory lock keyspace
+    job_lock_keyspace=1,  # Deprecated/vestigial, unused
     message_ttl=300,  # Keep completed messages for 5 minutes
     stuck_message_timeout=60,  # Consider message stuck after 1 minute
     enable_sweeping=True,  # Enable automatic cleanup

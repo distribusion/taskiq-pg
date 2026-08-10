@@ -10,7 +10,7 @@ The broker now uses an enhanced database schema with additional columns:
 
 - `status`: Tracks message state (queued, active, completed)
 - `scheduled_at`: Controls when messages become available for processing
-- `lock_key`: Used for PostgreSQL advisory locking
+- `lock_key`: Vestigial. Retained for rollout compatibility; claiming uses `FOR UPDATE SKIP LOCKED`, not advisory locks
 - `expire_at`: Automatic cleanup timestamp
 - `group_key`: For coordinating related messages
 - `retry_count`: Tracks retry attempts
@@ -22,7 +22,7 @@ The broker now uses an enhanced database schema with additional columns:
 ### API Changes
 
 The `AsyncpgBroker` constructor now accepts additional parameters:
-- `job_lock_keyspace`: Advisory lock keyspace (default: 1)
+- `job_lock_keyspace`: Deprecated/vestigial, no longer used (default: 1)
 - `message_ttl`: Time to live for completed messages in seconds (default: 86400)
 - `stuck_message_timeout`: Time before message is considered stuck (default: 300)
 - `enable_sweeping`: Enable automatic cleanup (default: True)
@@ -30,10 +30,10 @@ The `AsyncpgBroker` constructor now accepts additional parameters:
 
 ## New Features
 
-### 1. Advisory Locking
-- Prevents duplicate message processing using PostgreSQL advisory locks
-- Each message gets a unique lock that's held during processing
-- Locks are automatically released on acknowledgment
+### 1. Atomic Message Claiming
+- Prevents duplicate message processing using `SELECT ... FOR UPDATE SKIP LOCKED`
+- Each message is claimed by exactly one worker; a heartbeat lease guards it during processing
+- A dead worker's stale lease is reclaimed by the sweeper and re-queued
 
 ### 2. Message States
 - `queued`: Message waiting to be processed
