@@ -14,9 +14,9 @@ rebuilds an identical broker:
 * ``BENCH_BUSY_SECONDS``  - CPU busy-loop seconds for CPU-bound tasks (default: 0.005)
 * ``BENCH_SLEEP_SECONDS`` - asyncio.sleep seconds for I/O-bound tasks (default: 0.005)
 
-This broker has no claim/lock mechanism: every worker receives every NOTIFY, so
-``--workers > 1`` runs each task once per worker. Use ``--workers 1`` for a
-clean per-process number.
+This broker claims each message atomically (``FOR UPDATE SKIP LOCKED``), so a
+task is executed exactly once regardless of ``--workers``. Use ``--workers > 1``
+to measure concurrent drain across competing worker processes.
 """
 
 from __future__ import annotations
@@ -77,12 +77,19 @@ def _repo_root() -> str:
 
 
 async def _count_rows() -> int:
-    value = await broker.write_pool.fetchval(f"SELECT count(*) FROM {TABLE}")
+    # Outstanding work = not yet completed. This broker soft-completes (marks
+    # status='completed' for TTL) instead of deleting, so filter those out.
+    value = await broker.write_pool.fetchval(
+        f"SELECT count(*) FROM {TABLE} WHERE status <> 'completed'"
+    )
     return int(value or 0)
 
 
 async def _remaining_ids() -> list[int]:
-    rows = await broker.write_pool.fetch(f"SELECT id FROM {TABLE}")
+    # Only queued rows can be nudged with NOTIFY; active ones are in flight.
+    rows = await broker.write_pool.fetch(
+        f"SELECT id FROM {TABLE} WHERE status = 'queued'"
+    )
     return [int(r["id"]) for r in rows]
 
 
@@ -230,8 +237,8 @@ def _print_report(
     )
     if workers > 1:
         print(
-            f"\nNOTE: --workers {workers} -> each task executed up to {workers}x "
-            "(no claim/lock on this broker); drain reflects duplicate work."
+            f"\nNOTE: --workers {workers} compete for each message via "
+            "FOR UPDATE SKIP LOCKED; every task runs exactly once."
         )
 
 
