@@ -58,6 +58,9 @@ pretty = true
 show_error_codes = true
 exclude = ["examples", "bench"]
 
+[tool.pyright]
+pythonVersion = "3.9"
+
 [tool.ruff]
 line-length = 88
 
@@ -108,6 +111,9 @@ exclude = [".venv/"]
 mccabe = { max-complexity = 10 }
 
 [tool.ruff.lint.per-file-ignores]
+"taskiq_pg/broker_queries.py" = [
+  "S608", # SQL built from static enum values / table name, not user input
+]
 "tests/*" = [
   "S101",   # Use of assert detected
   "S301",   # Use of pickle detected

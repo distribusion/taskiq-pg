@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -8,7 +9,6 @@ from typing import (
     Optional,
     TypeVar,
     Union,
-    cast,
 )
 
 import asyncpg
@@ -16,10 +16,13 @@ from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessag
 from typing_extensions import override
 
 from taskiq_pg.broker_queries import (
+    CLEANUP_EXPIRED_QUERY,
+    COMPLETE_MESSAGE_QUERY,
     CREATE_TABLE_QUERY,
-    DELETE_MESSAGE_QUERY,
+    DEQUEUE_MESSAGE_QUERY,
+    HEARTBEAT_MESSAGES_QUERY,
     INSERT_MESSAGE_QUERY,
-    SELECT_MESSAGE_QUERY,
+    SWEEP_MESSAGES_QUERY,
 )
 
 _T = TypeVar("_T")
@@ -41,6 +44,12 @@ class AsyncpgBroker(AsyncBroker):
         max_retry_attempts: int = 5,
         connection_kwargs: Optional[dict[str, Any]] = None,
         pool_kwargs: Optional[dict[str, Any]] = None,
+        job_lock_keyspace: int = 1,
+        message_ttl: int = 86400,  # 24 hours default
+        stuck_message_timeout: int = 300,  # heartbeat-lease TTL; 10x beat interval
+        enable_sweeping: bool = True,
+        sweep_interval: int = 60,  # 1 minute default
+        heartbeat_interval: int = 30,  # liveness refresh period, seconds
     ) -> None:
         """
         Construct a new broker.
@@ -53,6 +62,12 @@ class AsyncpgBroker(AsyncBroker):
         :param max_retry_attempts: Maximum number of message processing attempts.
         :param connection_kwargs: Additional arguments for asyncpg connection.
         :param pool_kwargs: Additional arguments for asyncpg pool creation.
+        :param job_lock_keyspace: Deprecated; retained for signature back-compat.
+        :param message_ttl: Time to live for completed messages in seconds.
+        :param stuck_message_timeout: Lease staleness before a message is reclaimed.
+        :param enable_sweeping: Enable automatic reclamation of stuck messages.
+        :param sweep_interval: Interval between sweep operations in seconds.
+        :param heartbeat_interval: Interval between liveness refreshes in seconds.
         """
         super().__init__(
             result_backend=result_backend,
@@ -66,9 +81,22 @@ class AsyncpgBroker(AsyncBroker):
         )
         self.pool_kwargs: dict[str, Any] = pool_kwargs if pool_kwargs else {}
         self.max_retry_attempts: int = max_retry_attempts
+        self.job_lock_keyspace: int = job_lock_keyspace  # vestigial
+        self.message_ttl: int = message_ttl
+        self.stuck_message_timeout: int = stuck_message_timeout
+        self.enable_sweeping: bool = enable_sweeping
+        self.sweep_interval: int = sweep_interval
+        self.heartbeat_interval: int = heartbeat_interval
+
         self.read_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
+        self.dequeue_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
         self.write_pool: Optional["asyncpg.pool.Pool[asyncpg.Record]"] = None
         self._queue: Optional[asyncio.Queue[str]] = None
+        self._sweep_task: Optional[asyncio.Task[None]] = None
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._inflight_ids: set[int] = set()  # ids this process must keep alive
+        self._dequeue_lock: asyncio.Lock = asyncio.Lock()
+        self._connection_lock: asyncio.Lock = asyncio.Lock()
 
     @property
     def dsn(self) -> str:
@@ -80,43 +108,78 @@ class AsyncpgBroker(AsyncBroker):
             return self._dsn()
         return self._dsn
 
+    @staticmethod
+    def _resolve_ttl(labels: Any) -> int:
+        """Per-message TTL: positive `ttl` label wins, else caller's default."""
+        if isinstance(labels, str):
+            with contextlib.suppress(json.JSONDecodeError):
+                labels = json.loads(labels)
+        if isinstance(labels, dict):
+            ttl = labels.get("ttl")
+            if isinstance(ttl, (int, float)) and ttl > 0:
+                return int(ttl)
+        return -1
+
     @override
     async def startup(self) -> None:
         """Initialize the broker."""
         await super().startup()
 
         self.read_conn = await asyncpg.connect(self.dsn, **self.connection_kwargs)
+        self.dequeue_conn = await asyncpg.connect(self.dsn, **self.connection_kwargs)
         self.write_pool = await asyncpg.create_pool(self.dsn, **self.pool_kwargs)
 
         if self.read_conn is None:
             msg = "read_conn not initialized"
+            raise RuntimeError(msg)
+        if self.dequeue_conn is None:
+            msg = "dequeue_conn not initialized"
             raise RuntimeError(msg)
         if self.write_pool is None:
             msg = "write_pool not initialized"
             raise RuntimeError(msg)
 
         async with self.write_pool.acquire() as conn:
-            _ = await conn.execute(CREATE_TABLE_QUERY.format(self.table_name))
+            table_name_safe = self.table_name.replace('"', "").replace(" ", "_")
+            _ = await conn.execute(
+                CREATE_TABLE_QUERY.format(
+                    table_name=self.table_name,
+                    table_name_safe=table_name_safe,
+                )
+            )
 
         await self.read_conn.add_listener(self.channel_name, self._notification_handler)
         self._queue = asyncio.Queue()
+
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self.enable_sweeping:
+            self._sweep_task = asyncio.create_task(self._sweep_loop())
 
     @override
     async def shutdown(self) -> None:
         """Close all connections on shutdown."""
         await super().shutdown()
+
+        for task in (self._sweep_task, self._heartbeat_task):
+            if task is not None:
+                _ = task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
         if self.read_conn is not None:
             await self.read_conn.close()
+        if self.dequeue_conn is not None:
+            await self.dequeue_conn.close()
         if self.write_pool is not None:
             await self.write_pool.close()
 
     def _notification_handler(
         self,
-        con_ref: Union[
+        _con_ref: Union[
             "asyncpg.Connection[asyncpg.Record]",
             "asyncpg.pool.PoolConnectionProxy[asyncpg.Record]",
         ],
-        pid: int,
+        _pid: int,
         channel: str,
         payload: object,
         /,
@@ -139,7 +202,8 @@ class AsyncpgBroker(AsyncBroker):
         """
         Send message to the channel.
 
-        Inserts the message into the database and sends a NOTIFY.
+        Inserts the message into the database and sends a NOTIFY. TTL is applied
+        at completion time (see ack), not at insert, so expire_at starts NULL.
 
         :param message: Message to send.
         """
@@ -147,29 +211,35 @@ class AsyncpgBroker(AsyncBroker):
             raise ValueError("Please run startup before kicking.")
 
         async with self.write_pool.acquire() as conn:
-            # Insert the message into the database
-            message_inserted_id = cast(
-                int,
-                await conn.fetchval(
-                    INSERT_MESSAGE_QUERY.format(self.table_name),
-                    message.task_id,
-                    message.task_name,
-                    message.message.decode(),
-                    json.dumps(message.labels),
-                ),
-            )
-
+            group_key = message.labels.get("group_key")
             delay_value = message.labels.get("delay")
+
             if delay_value is not None:
                 delay_seconds = int(delay_value)
-                _ = asyncio.create_task(  # noqa: RUF006
-                    self._schedule_notification(message_inserted_id, delay_seconds)
-                )
+                scheduled_at_query = f"NOW() + INTERVAL '{delay_seconds} seconds'"
             else:
-                # Send a NOTIFY with the message ID as payload
-                _ = await conn.execute(
-                    f"NOTIFY {self.channel_name}, '{message_inserted_id}'"
-                )
+                scheduled_at_query = "NOW()"
+
+            result = await conn.fetchrow(
+                INSERT_MESSAGE_QUERY.format(
+                    table_name=self.table_name,
+                    scheduled_at=scheduled_at_query,
+                ),
+                message.task_id,
+                message.task_name,
+                message.message.decode(),
+                json.dumps(message.labels),
+                group_key,
+            )
+
+            if result is None:
+                raise RuntimeError("Failed to insert message")
+
+            message_inserted_id = result["id"]
+
+            _ = await conn.execute(
+                f"NOTIFY {self.channel_name}, '{message_inserted_id}'"
+            )
 
     async def _schedule_notification(self, message_id: int, delay_seconds: int) -> None:
         """Schedule a notification to be sent after a delay."""
@@ -177,35 +247,42 @@ class AsyncpgBroker(AsyncBroker):
         if self.write_pool is None:
             return
         async with self.write_pool.acquire() as conn:
-            # Send NOTIFY
             _ = await conn.execute(f"NOTIFY {self.channel_name}, '{message_id}'")
 
     @override
-    async def listen(self) -> AsyncGenerator[AckableMessage, None]:
+    async def listen(self) -> AsyncGenerator[AckableMessage, None]:  # noqa: C901
         """
         Listen to the channel.
 
-        Yields messages as they are received.
+        Yields messages as they are received using proper dequeuing with locking.
 
         :yields: AckableMessage instances.
         """
-        if self.read_conn is None:
+        if self.dequeue_conn is None:
             raise ValueError("Call startup before starting listening.")
         if self._queue is None:
             raise ValueError("Startup did not initialize the queue.")
 
         while True:
             try:
-                payload = await self._queue.get()
-                message_id = int(payload)
-                message_row = await self.read_conn.fetchrow(
-                    SELECT_MESSAGE_QUERY.format(self.table_name), message_id
-                )
+                message_row = await self._dequeue_message()
+
                 if message_row is None:
-                    logger.warning(
-                        f"Message with id {message_id} not found in database."
-                    )
+                    try:
+                        _ = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                        message_row = await self._dequeue_message()
+                    except asyncio.TimeoutError:
+                        message_row = await self._dequeue_message()
+
+                if message_row is None:
                     continue
+
+                message_id = message_row["id"]
+                # Per-message ttl label overrides broker default at completion.
+                resolved_ttl = self._resolve_ttl(message_row["labels"])
+                if resolved_ttl < 0:
+                    resolved_ttl = self.message_ttl
+
                 if message_row.get("message") is None:
                     msg = "Message row does not have 'message' column"
                     raise ValueError(msg)
@@ -215,17 +292,126 @@ class AsyncpgBroker(AsyncBroker):
                     raise ValueError(msg)
                 message_data = message_str.encode()
 
-                async def ack(*, _message_id: int = message_id) -> None:
+                self._inflight_ids.add(message_id)
+
+                async def ack(
+                    *, _message_id: int = message_id, _ttl: int = resolved_ttl
+                ) -> None:
                     if self.write_pool is None:
                         raise ValueError("Call startup before starting listening.")
 
+                    # Keep the lease refreshed until completion lands; discarding
+                    # early lets the sweeper reclaim a mid-ack row -> dup work.
                     async with self.write_pool.acquire() as conn:
                         _ = await conn.execute(
-                            DELETE_MESSAGE_QUERY.format(self.table_name),
+                            COMPLETE_MESSAGE_QUERY.format(table_name=self.table_name),
+                            _ttl,
                             _message_id,
                         )
+                    self._inflight_ids.discard(_message_id)
 
                 yield AckableMessage(data=message_data, ack=ack)
             except Exception as e:
                 logger.exception(f"Error processing message: {e}")
                 continue
+
+    async def _dequeue_message(self) -> Optional[asyncpg.Record]:
+        """
+        Dequeue a message using FOR UPDATE SKIP LOCKED.
+
+        Returns the message row if one is available, None otherwise.
+        """
+        if self.dequeue_conn is None:
+            return None
+
+        async with self._dequeue_lock:
+            try:
+                await self._ensure_connection_healthy()
+                dequeue_query = DEQUEUE_MESSAGE_QUERY.format(table_name=self.table_name)
+                async with self.dequeue_conn.transaction():
+                    return await self.dequeue_conn.fetchrow(dequeue_query)
+            except Exception as e:
+                logger.error(f"Error dequeuing message: {e}")
+                return None
+
+    async def _ensure_connection_healthy(self) -> None:
+        """Ensure the dequeue connection is healthy, reconnect if needed."""
+        if self.dequeue_conn is None:
+            return
+
+        async with self._connection_lock:
+            try:
+                await self.dequeue_conn.fetchval("SELECT 1")
+            except Exception as e:
+                logger.warning(f"Dequeue connection unhealthy, reconnecting: {e}")
+                with contextlib.suppress(Exception):
+                    await self.dequeue_conn.close()
+
+                self.dequeue_conn = await asyncpg.connect(
+                    self.dsn, **self.connection_kwargs
+                )
+
+    async def _heartbeat_loop(self) -> None:
+        """Refresh the lease on in-flight messages so the sweep leaves them alone."""
+        while True:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+                if not self._inflight_ids or self.write_pool is None:
+                    continue
+                ids = list(self._inflight_ids)
+                async with self.write_pool.acquire() as conn:
+                    _ = await conn.execute(
+                        HEARTBEAT_MESSAGES_QUERY.format(table_name=self.table_name), ids
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in heartbeat loop: {e}")
+
+    async def _sweep_loop(self) -> None:
+        """Background task to sweep stuck messages and clean up expired ones."""
+        while True:
+            try:
+                await asyncio.sleep(self.sweep_interval)
+                await self._sweep_stuck_messages()
+                await self._cleanup_expired_messages()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in sweep loop: {e}")
+
+    async def _sweep_stuck_messages(self) -> None:
+        """Reclaim messages whose heartbeat lease went stale."""
+        if self.write_pool is None:
+            return
+
+        try:
+            async with self.write_pool.acquire() as conn:
+                swept_ids = await conn.fetch(
+                    SWEEP_MESSAGES_QUERY.format(table_name=self.table_name),
+                    self.stuck_message_timeout,
+                )
+
+                if swept_ids:
+                    logger.info(f"Swept {len(swept_ids)} stuck messages back to queue")
+
+        except Exception as e:
+            logger.error(f"Error sweeping stuck messages: {e}")
+
+    async def _cleanup_expired_messages(self) -> None:
+        """Clean up messages that have expired."""
+        if self.write_pool is None:
+            return
+
+        try:
+            async with self.write_pool.acquire() as conn:
+                result = await conn.execute(
+                    CLEANUP_EXPIRED_QUERY.format(table_name=self.table_name)
+                )
+                deleted_count = int(result.split()[-1]) if result else 0
+
+                if deleted_count > 0:
+                    logger.debug(f"Cleaned up {deleted_count} expired messages")
+
+        except Exception as e:
+            logger.error(f"Error cleaning up expired messages: {e}")
