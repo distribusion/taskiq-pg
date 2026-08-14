@@ -30,10 +30,25 @@ ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIM
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE;
--- Legacy tables carry an auto-named CHECK without 'dead'. Drop both possible names,
--- re-add a deterministically named one so the dead-letter transition doesn't violate it.
-ALTER TABLE {{table_name}} DROP CONSTRAINT IF EXISTS {{table_name_safe}}_status_check;
-ALTER TABLE {{table_name}} ADD CONSTRAINT {{table_name_safe}}_status_check CHECK (status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.COMPLETED.value}', '{MessageStatus.DEAD.value}'));
+-- Legacy tables carry an auto-named CHECK without 'dead'. Only migrate when no
+-- existing check constraint already permits 'dead' — DROP/ADD takes ACCESS EXCLUSIVE
+-- and revalidates every row, so we must not run it on every startup.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = '{{table_name}}'::regclass
+          AND contype = 'c'
+          AND (SELECT attnum FROM pg_attribute
+               WHERE attrelid = '{{table_name}}'::regclass
+                 AND attname = 'status' AND NOT attisdropped) = ANY(conkey)
+          AND pg_get_constraintdef(oid) LIKE '%dead%'
+    ) THEN
+        ALTER TABLE {{table_name}} DROP CONSTRAINT IF EXISTS {{table_name_safe}}_status_check;
+        ALTER TABLE {{table_name}} ADD CONSTRAINT {{table_name_safe}}_status_check CHECK (status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.COMPLETED.value}', '{MessageStatus.DEAD.value}'));
+    END IF;
+END
+$do$;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_expire_at ON {{table_name}} (expire_at) WHERE expire_at IS NOT NULL;
