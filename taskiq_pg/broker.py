@@ -62,7 +62,7 @@ class AsyncpgBroker(AsyncBroker):
         :param max_retry_attempts: Maximum number of message processing attempts.
         :param connection_kwargs: Additional arguments for asyncpg connection.
         :param pool_kwargs: Additional arguments for asyncpg pool creation.
-        :param job_lock_keyspace: Advisory-lock keyspace for the group mutex; namespaces pg_advisory_xact_lock so group locks don't collide with other advisory-lock users on the same database.
+        :param job_lock_keyspace: Seed for the group-mutex advisory lock. Required for correctness: all workers processing the same table MUST pass the same stable, signed 32-bit integer, and each distinct broker/table should use a unique value so its group locks don't collide with other advisory-lock users on the database.
         :param message_ttl: Time to live for completed messages in seconds.
         :param stuck_message_timeout: Lease staleness before a message is reclaimed.
         :param enable_sweeping: Enable automatic reclamation of stuck messages.
@@ -81,7 +81,7 @@ class AsyncpgBroker(AsyncBroker):
         )
         self.pool_kwargs: dict[str, Any] = pool_kwargs if pool_kwargs else {}
         self.max_retry_attempts: int = max_retry_attempts
-        self.job_lock_keyspace: int = job_lock_keyspace  # advisory keyspace for group mutex
+        self.job_lock_keyspace: int = job_lock_keyspace  # group-mutex advisory seed
         self.message_ttl: int = message_ttl
         self.stuck_message_timeout: int = stuck_message_timeout
         self.enable_sweeping: bool = enable_sweeping

@@ -139,7 +139,7 @@ select convert_from(result, 'UTF8') from taskiq_results;
 - `max_retry_attempts`: Maximum number of message processing attempts.
 - `connection_kwargs`: Additional arguments for asyncpg connection.
 - `pool_kwargs`: Additional arguments for asyncpg pool creation.
-- `job_lock_keyspace`: Deprecated/vestigial. No longer used (claiming is via `FOR UPDATE SKIP LOCKED`); kept only for constructor compatibility.
+- `job_lock_keyspace`: Seed for the group-mutex advisory lock. Required for correctness of same-group serialization across processes: all workers on the same table must pass the same stable, signed 32-bit integer, and each distinct broker/table should use a unique value to avoid advisory-lock collisions.
 - `message_ttl`: Time to live for completed messages in seconds (default: 86400).
 - `stuck_message_timeout`: Time before message is considered stuck in seconds (default: 300).
 - `enable_sweeping`: Enable automatic cleanup of stuck messages (default: True).
