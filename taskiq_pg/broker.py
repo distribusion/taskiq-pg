@@ -62,7 +62,7 @@ class AsyncpgBroker(AsyncBroker):
         :param max_retry_attempts: Maximum number of message processing attempts.
         :param connection_kwargs: Additional arguments for asyncpg connection.
         :param pool_kwargs: Additional arguments for asyncpg pool creation.
-        :param job_lock_keyspace: Seed for the group-mutex advisory lock. Required for correctness: all workers processing the same table MUST pass the same stable, signed 32-bit integer, and each distinct broker/table should use a unique value so its group locks don't collide with other advisory-lock users on the database.
+        :param job_lock_keyspace: Seed for the group-mutex advisory lock. Required for correctness: all workers processing the same table MUST pass the same stable, signed 64-bit integer, and each distinct broker/table should use a unique value so its group locks don't collide with other advisory-lock users on the database.
         :param message_ttl: Time to live for completed messages in seconds.
         :param stuck_message_timeout: Lease staleness before a message is reclaimed.
         :param enable_sweeping: Enable automatic reclamation of stuck messages.
@@ -81,6 +81,12 @@ class AsyncpgBroker(AsyncBroker):
         )
         self.pool_kwargs: dict[str, Any] = pool_kwargs if pool_kwargs else {}
         self.max_retry_attempts: int = max_retry_attempts
+        # Bound to a SQL param (hashtextextended int8 seed); validate at construction
+        # so a bad value fails loudly instead of being swallowed by _dequeue_message.
+        if not isinstance(job_lock_keyspace, int):
+            raise TypeError("job_lock_keyspace must be an int")
+        if job_lock_keyspace.bit_length() > 63:
+            raise ValueError("job_lock_keyspace must fit a signed 64-bit integer")
         self.job_lock_keyspace: int = job_lock_keyspace  # group-mutex advisory seed
         self.message_ttl: int = message_ttl
         self.stuck_message_timeout: int = stuck_message_timeout

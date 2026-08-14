@@ -735,3 +735,12 @@ async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> 
     assert max_concurrent == 1  # group mutex held: never two active at once
     assert len(claimed) == backlog  # nothing lost
     assert len(set(claimed)) == backlog  # nothing claimed twice
+
+
+@pytest.mark.anyio
+async def test_job_lock_keyspace_validation(postgresql_dsn: str) -> None:
+    """Bad job_lock_keyspace fails at construction, not silently at dequeue."""
+    with pytest.raises(TypeError):
+        AsyncpgBroker(dsn=postgresql_dsn, job_lock_keyspace="1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        AsyncpgBroker(dsn=postgresql_dsn, job_lock_keyspace=2**63)
