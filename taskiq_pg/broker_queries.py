@@ -47,7 +47,12 @@ SELECT_MESSAGE_QUERY = "SELECT * FROM {table_name} WHERE id = $1"
 
 DELETE_MESSAGE_QUERY = "DELETE FROM {table_name} WHERE id = $1"
 
-# Claim exclusion = FOR UPDATE SKIP LOCKED only. Stamp heartbeat at claim (first beat).
+# Two locks, two jobs. Advisory-xact lock (group_key) = group mutex: makes
+# "no active row for this group? then claim it" atomic across workers, which the
+# NOT IN subquery alone can't under READ COMMITTED. FOR UPDATE SKIP LOCKED = don't
+# double-claim a row + let workers fan out. Ungrouped rows skip the advisory try.
+# 64-bit key via hashtextextended(group_key, $1): $1 is the keyspace seed, so distinct
+# groups (and keyspaces) almost never collide. Stamp heartbeat at claim (first beat).
 DEQUEUE_MESSAGE_QUERY = f"""
 WITH next_message AS (
     SELECT id
@@ -61,6 +66,8 @@ WITH next_message AS (
           WHERE status = '{MessageStatus.ACTIVE.value}'
             AND group_key IS NOT NULL
       ))
+      AND (group_key IS NULL
+           OR pg_try_advisory_xact_lock(hashtextextended(group_key, $1)))
     ORDER BY scheduled_at, created_at
     LIMIT 1
     FOR UPDATE SKIP LOCKED

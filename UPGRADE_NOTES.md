@@ -22,7 +22,7 @@ The broker now uses an enhanced database schema with additional columns:
 ### API Changes
 
 The `AsyncpgBroker` constructor now accepts additional parameters:
-- `job_lock_keyspace`: Deprecated/vestigial, no longer used (default: 1)
+- `job_lock_keyspace`: Seed for the group-mutex advisory lock (default: 1). Required for correctness: all workers on the same table must share the same stable signed 64-bit integer; use a unique value per broker/table to avoid advisory-lock collisions.
 - `message_ttl`: Time to live for completed messages in seconds (default: 86400)
 - `stuck_message_timeout`: Time before message is considered stuck (default: 300)
 - `enable_sweeping`: Enable automatic cleanup (default: True)
