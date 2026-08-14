@@ -466,6 +466,59 @@ async def test_retry_count_increments_across_reclaims(
 
 
 @pytest.mark.anyio
+async def test_sweep_dead_letters_at_max_retry_attempts(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A stale row that burns max_retry_attempts is parked in 'dead', not requeued."""
+    tbl = asyncpg_broker.table_name
+    asyncpg_broker.stuck_message_timeout = 1
+    asyncpg_broker.max_retry_attempts = 2
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    row_id = await _insert_active(conn, tbl, "poison", "NOW() - INTERVAL '10 seconds'")
+
+    # First reclaim: still under the cap -> back to queued, retry_count = 1.
+    await asyncpg_broker._sweep_stuck_messages()
+    first = await conn.fetchrow(
+        f"SELECT status, retry_count FROM {tbl} WHERE id = $1",  # noqa: S608
+        row_id,
+    )
+    assert first is not None and first["status"] == "queued"
+    assert first["retry_count"] == 1
+
+    # Re-arm as a stale active row, sweep again: hits the cap -> dead, retry_count = 2.
+    await conn.execute(
+        f"UPDATE {tbl} SET status = 'active', "  # noqa: S608
+        "heartbeat_at = NOW() - INTERVAL '10 seconds' WHERE id = $1",
+        row_id,
+    )
+    await asyncpg_broker._sweep_stuck_messages()
+    dead = await conn.fetchrow(
+        f"SELECT status, retry_count FROM {tbl} WHERE id = $1",  # noqa: S608
+        row_id,
+    )
+    await conn.close()
+    assert dead is not None and dead["status"] == "dead"
+    assert dead["retry_count"] == 2
+
+
+@pytest.mark.anyio
+async def test_dead_row_not_dequeued(asyncpg_broker: AsyncpgBroker) -> None:
+    """Dead-lettered rows are terminal: dequeue must skip them."""
+    tbl = asyncpg_broker.table_name
+    conn = await asyncpg.connect(asyncpg_broker.dsn)
+    dead_id = await conn.fetchval(
+        f"INSERT INTO {tbl} "  # noqa: S608
+        "(task_id, task_name, message, labels, status) "
+        "VALUES ($1, 'dead', 'x', '{}'::jsonb, 'dead') RETURNING id",
+        uuid.uuid4().hex,
+    )
+    await conn.close()
+
+    claimed = await asyncpg_broker._dequeue_message()
+    assert claimed is None or claimed["id"] != dead_id
+
+
+@pytest.mark.anyio
 async def test_heartbeat_prevents_reclaim_of_live_claim(
     asyncpg_broker: AsyncpgBroker,
 ) -> None:

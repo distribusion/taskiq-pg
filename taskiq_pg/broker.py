@@ -24,6 +24,7 @@ from taskiq_pg.broker_queries import (
     INSERT_MESSAGE_QUERY,
     SWEEP_MESSAGES_QUERY,
 )
+from taskiq_pg.status import MessageStatus
 
 _T = TypeVar("_T")
 logger = logging.getLogger("taskiq.asyncpg_broker")
@@ -395,13 +396,21 @@ class AsyncpgBroker(AsyncBroker):
 
         try:
             async with self.write_pool.acquire() as conn:
-                swept_ids = await conn.fetch(
+                swept = await conn.fetch(
                     SWEEP_MESSAGES_QUERY.format(table_name=self.table_name),
                     self.stuck_message_timeout,
+                    self.max_retry_attempts,
                 )
 
-                if swept_ids:
-                    logger.info(f"Swept {len(swept_ids)} stuck messages back to queue")
+                if swept:
+                    dead = sum(
+                        1 for r in swept if r["status"] == MessageStatus.DEAD.value
+                    )
+                    requeued = len(swept) - dead
+                    logger.info(
+                        f"Swept {len(swept)} stuck messages: "
+                        f"{requeued} requeued, {dead} dead-lettered"
+                    )
 
         except Exception as e:
             logger.error(f"Error sweeping stuck messages: {e}")
