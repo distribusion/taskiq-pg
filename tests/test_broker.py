@@ -573,13 +573,14 @@ async def test_concurrent_claim_exclusivity(asyncpg_broker: AsyncpgBroker) -> No
         )
 
     dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
+    keyspace = asyncpg_broker.job_lock_keyspace
 
     async def drain(claimed: list[int]) -> None:
         conn = await asyncpg.connect(asyncpg_broker.dsn)
         try:
             while True:
                 async with conn.transaction():
-                    row = await conn.fetchrow(dequeue_sql)
+                    row = await conn.fetchrow(dequeue_sql, keyspace)
                 if row is None:
                     return
                 claimed.append(int(row["id"]))
@@ -595,3 +596,142 @@ async def test_concurrent_claim_exclusivity(asyncpg_broker: AsyncpgBroker) -> No
     assert len(all_ids) == backlog  # nothing lost
     assert len(set(all_ids)) == backlog  # nothing claimed twice
     assert a and b  # both consumers actually did work
+
+
+@pytest.mark.anyio
+async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> None:
+    """Cross-process group mutex, deterministic interleaving.
+
+    Two asyncpg connections = two backends, i.e. two workers as far as Postgres and
+    the advisory lock are concerned. We drive the race window by hand (hold A's txn
+    open, run B inside it) instead of gather() so the failure is reproducible rather
+    than timing-dependent.
+
+    Without the advisory lock both connections' READ COMMITTED snapshots see the
+    other's row as 'queued' during the check-and-set window and both promote. With it,
+    B's pg_try_advisory_xact_lock fails while A's txn holds it, so B claims nothing.
+    """
+    tbl = asyncpg_broker.table_name
+    keyspace = asyncpg_broker.job_lock_keyspace
+    group_key = "grp_race"
+
+    for _ in range(2):
+        await asyncpg_broker.kick(
+            BrokerMessage(
+                task_id=uuid.uuid4().hex,
+                task_name="t",
+                message=b"x",
+                labels={"group_key": group_key},
+            )
+        )
+
+    dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
+    conn_a = await asyncpg.connect(asyncpg_broker.dsn)
+    conn_b = await asyncpg.connect(asyncpg_broker.dsn)
+    try:
+        tx_a = conn_a.transaction()
+        tx_b = conn_b.transaction()
+        await tx_a.start()
+        await tx_b.start()
+
+        # A claims a row of the group and holds the advisory lock (txn still open).
+        row_a = await conn_a.fetchrow(dequeue_sql, keyspace)
+        assert row_a is not None
+
+        # B runs while A is uncommitted: A's row still looks 'queued' to B, but the
+        # group's advisory lock is held -> B must claim nothing.
+        row_b = await conn_b.fetchrow(dequeue_sql, keyspace)
+        assert row_b is None
+
+        await tx_a.commit()
+        await tx_b.commit()
+
+        # Group now has an active row -> the NOT IN(active) guard keeps the second
+        # queued row parked even after A's lock is released.
+        row_b2 = await conn_b.fetchrow(dequeue_sql, keyspace)
+        assert row_b2 is None
+
+        # Complete A's row; the group frees and the second row becomes claimable.
+        assert asyncpg_broker.write_pool is not None
+        _ = await asyncpg_broker.write_pool.execute(
+            COMPLETE_MESSAGE_QUERY.format(table_name=tbl),
+            asyncpg_broker.message_ttl,
+            row_a["id"],
+        )
+        async with conn_b.transaction():
+            row_b3 = await conn_b.fetchrow(dequeue_sql, keyspace)
+        assert row_b3 is not None
+        assert row_b3["id"] != row_a["id"]
+    finally:
+        await conn_a.close()
+        await conn_b.close()
+
+
+@pytest.mark.anyio
+async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> None:
+    """Actual contention: N workers on N connections hammer one group at once.
+
+    All rows share a group_key, so the mutex allows at most one active at a time.
+    Each worker: dequeue -> (hold the claim briefly) -> complete, in a loop until the
+    backlog drains. The invariant checked live is that no two workers ever hold a
+    claim of the group simultaneously; the totals confirm nothing is lost or
+    double-claimed.
+    """
+    tbl = asyncpg_broker.table_name
+    keyspace = asyncpg_broker.job_lock_keyspace
+    group_key = "grp_concurrent"
+    backlog = 30
+    workers = 8
+
+    for _ in range(backlog):
+        await asyncpg_broker.kick(
+            BrokerMessage(
+                task_id=uuid.uuid4().hex,
+                task_name="t",
+                message=b"x",
+                labels={"group_key": group_key},
+            )
+        )
+
+    dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
+    complete_sql = COMPLETE_MESSAGE_QUERY.format(table_name=tbl)
+    ttl = asyncpg_broker.message_ttl
+
+    active_now = 0
+    max_concurrent = 0
+    claimed: list[int] = []
+
+    async def worker() -> None:
+        nonlocal active_now, max_concurrent
+        conn = await asyncpg.connect(asyncpg_broker.dsn)
+        try:
+            while True:
+                async with conn.transaction():
+                    row = await conn.fetchrow(dequeue_sql, keyspace)
+                if row is None:
+                    # Either drained, or the single active slot is taken. Distinguish:
+                    # if any row is still queued, back off and retry; else stop.
+                    remaining = await conn.fetchval(
+                        f"SELECT COUNT(*) FROM {tbl} "  # noqa: S608
+                        "WHERE status = 'queued' AND group_key = $1",
+                        group_key,
+                    )
+                    if remaining == 0:
+                        return
+                    await asyncio.sleep(0.01)
+                    continue
+
+                active_now += 1
+                max_concurrent = max(max_concurrent, active_now)
+                claimed.append(int(row["id"]))
+                await asyncio.sleep(0)  # force a scheduling point while "active"
+                active_now -= 1
+                await conn.execute(complete_sql, ttl, row["id"])
+        finally:
+            await conn.close()
+
+    await asyncio.gather(*(worker() for _ in range(workers)))
+
+    assert max_concurrent == 1  # group mutex held: never two active at once
+    assert len(claimed) == backlog  # nothing lost
+    assert len(set(claimed)) == backlog  # nothing claimed twice

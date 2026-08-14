@@ -62,7 +62,7 @@ class AsyncpgBroker(AsyncBroker):
         :param max_retry_attempts: Maximum number of message processing attempts.
         :param connection_kwargs: Additional arguments for asyncpg connection.
         :param pool_kwargs: Additional arguments for asyncpg pool creation.
-        :param job_lock_keyspace: Deprecated; retained for signature back-compat.
+        :param job_lock_keyspace: Advisory-lock keyspace for the group mutex; namespaces pg_advisory_xact_lock so group locks don't collide with other advisory-lock users on the same database.
         :param message_ttl: Time to live for completed messages in seconds.
         :param stuck_message_timeout: Lease staleness before a message is reclaimed.
         :param enable_sweeping: Enable automatic reclamation of stuck messages.
@@ -81,7 +81,7 @@ class AsyncpgBroker(AsyncBroker):
         )
         self.pool_kwargs: dict[str, Any] = pool_kwargs if pool_kwargs else {}
         self.max_retry_attempts: int = max_retry_attempts
-        self.job_lock_keyspace: int = job_lock_keyspace  # vestigial
+        self.job_lock_keyspace: int = job_lock_keyspace  # advisory keyspace for group mutex
         self.message_ttl: int = message_ttl
         self.stuck_message_timeout: int = stuck_message_timeout
         self.enable_sweeping: bool = enable_sweeping
@@ -329,7 +329,9 @@ class AsyncpgBroker(AsyncBroker):
                 await self._ensure_connection_healthy()
                 dequeue_query = DEQUEUE_MESSAGE_QUERY.format(table_name=self.table_name)
                 async with self.dequeue_conn.transaction():
-                    return await self.dequeue_conn.fetchrow(dequeue_query)
+                    return await self.dequeue_conn.fetchrow(
+                        dequeue_query, self.job_lock_keyspace
+                    )
             except Exception as e:
                 logger.error(f"Error dequeuing message: {e}")
                 return None
