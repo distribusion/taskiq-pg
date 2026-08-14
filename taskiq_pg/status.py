@@ -22,3 +22,4 @@ class MessageStatus(StrEnum):
     QUEUED = "queued"
     ACTIVE = "active"
     COMPLETED = "completed"
+    DEAD = "dead"  # exhausted max_retry_attempts; parked for inspection
