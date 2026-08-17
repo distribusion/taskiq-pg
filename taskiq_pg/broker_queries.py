@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
     expire_at TIMESTAMP WITH TIME ZONE,
     group_key VARCHAR,
     retry_count INTEGER DEFAULT 0,
-    heartbeat_at TIMESTAMP WITH TIME ZONE
+    heartbeat_at TIMESTAMP WITH TIME ZONE,
+    ordered BOOLEAN NOT NULL DEFAULT FALSE
 );
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}';
@@ -30,6 +31,8 @@ ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIM
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE;
+-- Opt-in FIFO. Metadata-only on PG11+; existing rows read false, i.e. mutex-only.
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS ordered BOOLEAN NOT NULL DEFAULT FALSE;
 -- Legacy tables carry an auto-named CHECK without 'dead'. Only migrate when no
 -- existing check constraint already permits 'dead' — DROP/ADD takes ACCESS EXCLUSIVE
 -- and revalidates every row, so we must not run it on every startup.
@@ -49,16 +52,21 @@ BEGIN
     END IF;
 END
 $do$;
-CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
+-- Serves the dequeue scan: leading status is redundant inside a partial index on
+-- status, so key on (scheduled_at, id) to satisfy ORDER BY without a sort node.
+CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_scheduled_id ON {{table_name}} (scheduled_at, id) WHERE status = '{MessageStatus.QUEUED.value}';
+DROP INDEX IF EXISTS idx_{{table_name_safe}}_status_scheduled;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';
+-- Serves the head-of-line probe: "any older unfinished row in my group?"
+CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_unfinished ON {{table_name}} (group_key, id) WHERE group_key IS NOT NULL AND status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}');
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_expire_at ON {{table_name}} (expire_at) WHERE expire_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_active_heartbeat ON {{table_name}} (heartbeat_at) WHERE status = '{MessageStatus.ACTIVE.value}';
 """  # noqa: E501
 
 INSERT_MESSAGE_QUERY = """
 INSERT INTO {table_name}
-    (task_id, task_name, message, labels, group_key, expire_at, scheduled_at)
-VALUES ($1, $2, $3, $4, $5, NULL, {scheduled_at})
+    (task_id, task_name, message, labels, group_key, ordered, expire_at, scheduled_at)
+VALUES ($1, $2, $3, $4, $5, $6, NULL, {scheduled_at})
 RETURNING id
 """
 
@@ -66,28 +74,43 @@ SELECT_MESSAGE_QUERY = "SELECT * FROM {table_name} WHERE id = $1"
 
 DELETE_MESSAGE_QUERY = "DELETE FROM {table_name} WHERE id = $1"
 
-# Two locks, two jobs. Advisory-xact lock (group_key) = group mutex: makes
-# "no active row for this group? then claim it" atomic across workers, which the
-# NOT IN subquery alone can't under READ COMMITTED. FOR UPDATE SKIP LOCKED = don't
-# double-claim a row + let workers fan out. Ungrouped rows skip the advisory try.
-# 64-bit key via hashtextextended(group_key, $1): $1 is the keyspace seed, so distinct
-# groups (and keyspaces) almost never collide. Stamp heartbeat at claim (first beat).
+# Claims one message. Four guards, and the window each covers:
+#   group mutex   -- at most one active row per group_key. Covers the task's whole run:
+#                    it reads status, which stays 'active' until ack.
+#   advisory lock -- covers only the claim itself, released at commit. Two workers
+#                    reading 'no active row' in the same instant both pass the mutex
+#                    under READ COMMITTED; this is what stops them. $1 = keyspace seed.
+#                    Ungrouped rows skip it.
+#   head-of-line  -- opt-in via `ordered`: wait for older unfinished rows in the group.
+#                    'queued' counts, so a row in retry backoff blocks.
+#   skip locked   -- guards the row rather than the group: one claimer per row, and
+#                    workers step over each other's locks instead of queueing on them.
+# Claim order within a group is by id. Heartbeat is stamped at claim.
 DEQUEUE_MESSAGE_QUERY = f"""
 WITH next_message AS (
-    SELECT id
-    FROM {{table_name}}
-    WHERE status = '{MessageStatus.QUEUED.value}'
-      AND scheduled_at <= NOW()
-      AND (expire_at IS NULL OR expire_at > NOW())
-      AND (group_key IS NULL OR group_key NOT IN (
-          SELECT DISTINCT group_key
-          FROM {{table_name}}
-          WHERE status = '{MessageStatus.ACTIVE.value}'
-            AND group_key IS NOT NULL
+    SELECT m.id
+    FROM {{table_name}} m
+    WHERE m.status = '{MessageStatus.QUEUED.value}'
+      AND m.scheduled_at <= NOW()
+      AND (m.expire_at IS NULL OR m.expire_at > NOW())
+      AND (m.group_key IS NULL OR (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM {{table_name}} a
+                  WHERE a.group_key = m.group_key
+                    AND a.status = '{MessageStatus.ACTIVE.value}'
+              )
+              AND (NOT m.ordered OR NOT EXISTS (
+                  SELECT 1
+                  FROM {{table_name}} o
+                  WHERE o.group_key = m.group_key
+                    AND o.status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}')
+                    AND o.id < m.id
+              ))
       ))
-      AND (group_key IS NULL
-           OR pg_try_advisory_xact_lock(hashtextextended(group_key, $1)))
-    ORDER BY scheduled_at, created_at
+      AND (m.group_key IS NULL
+           OR pg_try_advisory_xact_lock(hashtextextended(m.group_key, $1)))
+    ORDER BY m.scheduled_at, m.id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
@@ -96,7 +119,7 @@ SET status = '{MessageStatus.ACTIVE.value}', heartbeat_at = NOW()
 FROM next_message
 WHERE {{table_name}}.id = next_message.id
 RETURNING {{table_name}}.*
-"""
+"""  # noqa: E501
 
 # Batched liveness refresh for this process's in-flight ids. status guard avoids
 # resurrecting a row already swept back to queued.
