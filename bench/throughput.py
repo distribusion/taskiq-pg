@@ -17,6 +17,11 @@ rebuilds an identical broker:
 This broker claims each message atomically (``FOR UPDATE SKIP LOCKED``), so a
 task is executed exactly once regardless of ``--workers``. Use ``--workers > 1``
 to measure concurrent drain across competing worker processes.
+
+``--groups N`` spreads the tasks over N ``group_key`` values, which caps
+concurrency at N (one active message per group). Adding ``--ordered`` also
+enforces FIFO within each group; compare the two at the same ``--groups`` to
+price the head-of-line predicate.
 """
 
 from __future__ import annotations
@@ -155,15 +160,21 @@ async def _wait_ready(timeout: float) -> bool:
     return await _count_rows() == 0
 
 
-async def _kick_many(count: int, concurrency: int) -> float:
+async def _kick_many(count: int, concurrency: int, groups: int, ordered: bool) -> float:
     sem = asyncio.Semaphore(concurrency)
 
-    async def one() -> None:
+    async def one(index: int) -> None:
         async with sem:
-            await bench_task.kiq()
+            if groups:
+                kicker = bench_task.kicker().with_labels(
+                    group_key=f"g{index % groups}", ordered=ordered
+                )
+                await kicker.kiq()
+            else:
+                await bench_task.kiq()
 
     start = time.monotonic()
-    await asyncio.gather(*(one() for _ in range(count)))
+    await asyncio.gather(*(one(i) for i in range(count)))
     return time.monotonic() - start
 
 
@@ -222,22 +233,30 @@ async def _teardown_worker(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-def _print_report(
-    count: int, workers: int, max_async_tasks: int, total_elapsed: float
-) -> None:
+def _print_report(args: argparse.Namespace, total_elapsed: float) -> None:
+    if args.groups:
+        mode = f"{args.groups} groups, {'ordered' if args.ordered else 'mutex only'}"
+    else:
+        mode = "ungrouped"
     print("\n=== throughput report ===")
-    print(f"tasks                : {count}")
-    print(f"workers              : {workers}")
-    print(f"max_async_tasks      : {max_async_tasks}")
+    print(f"tasks                : {args.count}")
+    print(f"workers              : {args.workers}")
+    print(f"max_async_tasks      : {args.max_async_tasks}")
+    print(f"mode                 : {mode}")
     print(f"table                : {TABLE}")
     print("-")
     print(
         f"end-to-end           : {total_elapsed:8.3f}s  "
-        f"({count / total_elapsed:10.1f} tasks/s)"
+        f"({args.count / total_elapsed:10.1f} tasks/s)"
     )
-    if workers > 1:
+    if args.groups:
         print(
-            f"\nNOTE: --workers {workers} compete for each message via "
+            f"\nNOTE: --groups {args.groups} caps concurrency at {args.groups} "
+            "(one active message per group)."
+        )
+    if args.workers > 1:
+        print(
+            f"\nNOTE: --workers {args.workers} compete for each message via "
             "FOR UPDATE SKIP LOCKED; every task runs exactly once."
         )
 
@@ -263,11 +282,11 @@ async def _run(args: argparse.Namespace) -> int:
         print("worker ready; enqueuing tasks...")
 
         kick_start = time.monotonic()
-        await _kick_many(args.count, args.kick_concurrency)
+        await _kick_many(args.count, args.kick_concurrency, args.groups, args.ordered)
         await _drain(args.drain_timeout, args.stall_timeout)
         total_elapsed = time.monotonic() - kick_start
 
-        _print_report(args.count, args.workers, args.max_async_tasks, total_elapsed)
+        _print_report(args, total_elapsed)
         return 0
     finally:
         if proc is not None:
@@ -292,7 +311,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--drain-timeout", type=float, default=300.0)
     parser.add_argument("--stall-timeout", type=float, default=10.0)
     parser.add_argument("--worker-output", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--groups",
+        type=int,
+        default=0,
+        help="spread tasks over N group_keys (0 = ungrouped)",
+    )
+    parser.add_argument(
+        "--ordered",
+        action="store_true",
+        help="FIFO within each group; requires --groups",
+    )
+    args = parser.parse_args()
+    if args.ordered and not args.groups:
+        parser.error("--ordered requires --groups")
+    return args
 
 
 def main() -> None:
