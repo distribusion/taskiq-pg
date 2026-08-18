@@ -52,7 +52,23 @@ BEGIN
     END IF;
 END
 $do$;
-CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
+-- Superseded by _scheduled_id: status is constant inside a partial index on status.
+-- Matched by indrelid, not by name: a same-named index on another table or schema is
+-- not ours to drop, and an unqualified DROP would resolve through search_path.
+DO $do$
+DECLARE
+    victim oid;
+BEGIN
+    SELECT i.indexrelid INTO victim
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = to_regclass('{{table_name}}')
+      AND c.relname = 'idx_{{table_name_safe}}_status_scheduled';
+    IF victim IS NOT NULL THEN
+        EXECUTE format('DROP INDEX %s', victim::regclass);
+    END IF;
+END
+$do$;
 -- ORDER BY (scheduled_at, id) needs the tiebreak in the index or it sorts per call.
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_scheduled_id ON {{table_name}} (scheduled_at, id) WHERE status = '{MessageStatus.QUEUED.value}';
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';

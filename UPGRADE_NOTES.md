@@ -20,6 +20,12 @@ The broker now uses an enhanced database schema with additional columns:
 1. Drop and recreate the messages table (losing existing messages)
 2. Manually add the new columns with appropriate defaults
 
+### Retired Index
+
+`idx_<table>_status_scheduled` is dropped at startup. `idx_<table>_scheduled_id`
+supersedes it — `status` is constant inside a partial index on `status`, and the
+dequeue orders by `(scheduled_at, id)`.
+
 ### New Database Object
 
 The broker creates a `<table_name>_claim(BIGINT)` plpgsql function at startup and
