@@ -20,6 +20,13 @@ The broker now uses an enhanced database schema with additional columns:
 1. Drop and recreate the messages table (losing existing messages)
 2. Manually add the new columns with appropriate defaults
 
+### New Database Object
+
+The broker creates a `<table_name>_claim(BIGINT)` plpgsql function at startup and
+dequeues through it. The connecting role needs `CREATE` on the schema. It returns
+`BIGINT`, not the table's row type, so it is not a dependency of the table and
+`DROP TABLE` still works; startup recreates it with `CREATE OR REPLACE`.
+
 ### API Changes
 
 The `AsyncpgBroker` constructor now accepts additional parameters:
