@@ -361,7 +361,7 @@ class AsyncpgBroker(AsyncBroker):
 
     async def _dequeue_message(self) -> Optional[asyncpg.Record]:
         """
-        Dequeue a message using FOR UPDATE SKIP LOCKED.
+        Claim one message on the dedicated dequeue connection.
 
         Returns the message row if one is available, None otherwise.
         """
