@@ -52,13 +52,12 @@ BEGIN
     END IF;
 END
 $do$;
--- Serves the dequeue scan: leading status is redundant inside a partial index on
--- status, so key on (scheduled_at, id) to satisfy ORDER BY without a sort node.
+CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
+-- ORDER BY (scheduled_at, id) needs the tiebreak in the index or it sorts per call.
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_scheduled_id ON {{table_name}} (scheduled_at, id) WHERE status = '{MessageStatus.QUEUED.value}';
-DROP INDEX IF EXISTS idx_{{table_name_safe}}_status_scheduled;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';
--- Serves the head-of-line probe: "any older unfinished row in my group?"
-CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_unfinished ON {{table_name}} (group_key, id) WHERE group_key IS NOT NULL AND status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}');
+-- Serves both group probes: older unfinished rows, and dead rows that halt the group.
+CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_state ON {{table_name}} (group_key, status, id) WHERE group_key IS NOT NULL AND status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.DEAD.value}');
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_expire_at ON {{table_name}} (expire_at) WHERE expire_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_active_heartbeat ON {{table_name}} (heartbeat_at) WHERE status = '{MessageStatus.ACTIVE.value}';
 """  # noqa: E501
@@ -74,18 +73,11 @@ SELECT_MESSAGE_QUERY = "SELECT * FROM {table_name} WHERE id = $1"
 
 DELETE_MESSAGE_QUERY = "DELETE FROM {table_name} WHERE id = $1"
 
-# Claims one message. Four guards, and the window each covers:
-#   group mutex   -- at most one active row per group_key. Covers the task's whole run:
-#                    it reads status, which stays 'active' until ack.
-#   advisory lock -- covers only the claim itself, released at commit. Two workers
-#                    reading 'no active row' in the same instant both pass the mutex
-#                    under READ COMMITTED; this is what stops them. $1 = keyspace seed.
-#                    Ungrouped rows skip it.
-#   head-of-line  -- opt-in via `ordered`: wait for older unfinished rows in the group.
-#                    'queued' counts, so a row in retry backoff blocks.
-#   skip locked   -- guards the row rather than the group: one claimer per row, and
-#                    workers step over each other's locks instead of queueing on them.
-# Claim order within a group is by id. Heartbeat is stamped at claim.
+# Claims one message. Guards: group mutex (one active row per group_key), advisory
+# lock ($1 = keyspace seed, closes the check-and-set race the mutex alone loses under
+# READ COMMITTED), head-of-line and dead-halt (both opt-in via `ordered`, both id-
+# correlated so they probe an index rather than hash), FOR UPDATE SKIP LOCKED (one
+# claimer per row). Claim order within a group is by id; heartbeat stamped at claim.
 DEQUEUE_MESSAGE_QUERY = f"""
 WITH next_message AS (
     SELECT m.id
@@ -100,12 +92,21 @@ WITH next_message AS (
                   WHERE a.group_key = m.group_key
                     AND a.status = '{MessageStatus.ACTIVE.value}'
               )
-              AND (NOT m.ordered OR NOT EXISTS (
-                  SELECT 1
-                  FROM {{table_name}} o
-                  WHERE o.group_key = m.group_key
-                    AND o.status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}')
-                    AND o.id < m.id
+              AND (NOT m.ordered OR (
+                  NOT EXISTS (
+                      SELECT 1
+                      FROM {{table_name}} o
+                      WHERE o.group_key = m.group_key
+                        AND o.status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}')
+                        AND o.id < m.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {{table_name}} d
+                      WHERE d.group_key = m.group_key
+                        AND d.status = '{MessageStatus.DEAD.value}'
+                        AND d.id < m.id
+                  )
               ))
       ))
       AND (m.group_key IS NULL

@@ -931,6 +931,93 @@ async def test_ordered_group_does_not_block_other_groups(
 
 
 @pytest.mark.anyio
+async def _kill(broker: AsyncpgBroker, row_id: int) -> None:
+    """Dead-letter a row, as the sweeper does at max_retry_attempts."""
+    assert broker.write_pool is not None
+    _ = await broker.write_pool.execute(
+        f"UPDATE {broker.table_name} SET status = 'dead' WHERE id = $1",  # noqa: S608
+        row_id,
+    )
+
+
+@pytest.mark.anyio
+async def test_swept_ordered_row_keeps_its_slot(asyncpg_broker: AsyncpgBroker) -> None:
+    """The sweeper moves rows back to 'queued' behind the dequeue's back."""
+    group_key = "swept"
+    await _kick_group(asyncpg_broker, group_key, "first", ordered=True)
+    # 'second' sorts first by scheduled_at, so only the ordering clause holds it back
+    await _kick_group(asyncpg_broker, group_key, "second", ordered=True, delay=-5)
+
+    first = await asyncpg_broker._dequeue_message()
+    assert first is not None
+    assert first["task_name"] == "first"
+
+    assert asyncpg_broker.write_pool is not None
+    _ = await asyncpg_broker.write_pool.execute(
+        f"UPDATE {asyncpg_broker.table_name} "  # noqa: S608
+        "SET heartbeat_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+        first["id"],
+    )
+    await asyncpg_broker._sweep_stuck_messages()
+
+    row = await asyncpg_broker._dequeue_message()
+    assert row is not None
+    assert row["task_name"] == "first"  # reclaimed head, not overtaken by 'second'
+
+
+@pytest.mark.anyio
+async def test_dead_row_halts_its_ordered_group(asyncpg_broker: AsyncpgBroker) -> None:
+    """A dead row must not be skipped: the group stops rather than losing order."""
+    group_key = "halted"
+    await _kick_group(asyncpg_broker, group_key, "first", ordered=True)
+    await _kick_group(asyncpg_broker, group_key, "second", ordered=True)
+
+    first = await asyncpg_broker._dequeue_message()
+    assert first is not None
+    await _kill(asyncpg_broker, int(first["id"]))
+
+    assert await asyncpg_broker._dequeue_message() is None
+
+
+@pytest.mark.anyio
+async def test_dead_row_does_not_halt_an_unordered_group(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """Halting is opt-in with `ordered`; mutex-only groups keep skipping dead rows."""
+    group_key = "not_halted"
+    await _kick_group(asyncpg_broker, group_key, "first", ordered=False)
+    await _kick_group(asyncpg_broker, group_key, "second", ordered=False)
+
+    first = await asyncpg_broker._dequeue_message()
+    assert first is not None
+    await _kill(asyncpg_broker, int(first["id"]))
+
+    second = await asyncpg_broker._dequeue_message()
+    assert second is not None
+    assert second["task_name"] == "second"
+
+
+@pytest.mark.anyio
+async def test_dead_row_halts_only_its_own_group(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A halted group must not stop the rest of the queue."""
+    await _kick_group(asyncpg_broker, "halted", "doomed", ordered=True)
+    await _kick_group(asyncpg_broker, "halted", "stuck", ordered=True)
+    await _kick_group(asyncpg_broker, "healthy", "runnable", ordered=True)
+
+    doomed = await asyncpg_broker._dequeue_message()
+    assert doomed is not None
+    await _kill(asyncpg_broker, int(doomed["id"]))
+
+    claimed = set()
+    while (row := await asyncpg_broker._dequeue_message()) is not None:
+        claimed.add(str(row["task_name"]))
+        await _complete(asyncpg_broker, int(row["id"]))
+    assert claimed == {"runnable"}
+
+
+@pytest.mark.anyio
 async def test_ordered_label_validation(asyncpg_broker: AsyncpgBroker) -> None:
     """`ordered` is strict: it needs a group, and it will not guess at a value."""
     with pytest.raises(ValueError, match="requires a `group_key`"):
