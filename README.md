@@ -163,6 +163,19 @@ You can prevent concurrent execution of related tasks by setting a `group_key` i
 await my_task.kicker().with_labels(group_key="user_123").kiq()
 ```
 
+### Ordered Groups
+Add `ordered=True` to run a group in insertion order as well. An ordered message is claimed only once every older message in its group has finished, so a message that is delayed or retrying is not overtaken:
+
+```python
+await my_task.kicker().with_labels(group_key="user_123", ordered=True).kiq()
+```
+
+Order follows the broker's `id`, not `scheduled_at`, so a `delay` label cannot move a message ahead of its group. The label requires a `group_key` and must be a bool. It is opt-in per message: unlabelled messages keep the mutex-only behaviour above. Note that a blocked group correctly looks like a stalled queue, and that workers on older versions of this broker ignore the column — roll the broker out everywhere before setting the label.
+
+A dead-lettered message halts its group: nothing behind it is claimed until it is resolved. Skipping it would drop a message out of the ordered stream with no signal. Unordered groups are unaffected and continue past dead rows as before.
+
+Each group must be enqueued by a single producer. `id` comes from a sequence and is assigned before the transaction commits, so two producers writing the same group at once can commit ids out of order: the higher id becomes visible first and is claimed, and the lower id then arrives with nothing older left to wait for.
+
 ### Message TTL
 Control how long completed messages are retained:
 

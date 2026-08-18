@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
     expire_at TIMESTAMP WITH TIME ZONE,
     group_key VARCHAR,
     retry_count INTEGER DEFAULT 0,
-    heartbeat_at TIMESTAMP WITH TIME ZONE
+    heartbeat_at TIMESTAMP WITH TIME ZONE,
+    ordered BOOLEAN NOT NULL DEFAULT FALSE
 );
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '{MessageStatus.QUEUED.value}';
@@ -30,6 +31,8 @@ ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIM
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE;
+-- Opt-in FIFO. Metadata-only on PG11+; existing rows read false, i.e. mutex-only.
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS ordered BOOLEAN NOT NULL DEFAULT FALSE;
 -- Legacy tables carry an auto-named CHECK without 'dead'. Only migrate when no
 -- existing check constraint already permits 'dead' — DROP/ADD takes ACCESS EXCLUSIVE
 -- and revalidates every row, so we must not run it on every startup.
@@ -50,15 +53,19 @@ BEGIN
 END
 $do$;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
+-- ORDER BY (scheduled_at, id) needs the tiebreak in the index or it sorts per call.
+CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_scheduled_id ON {{table_name}} (scheduled_at, id) WHERE status = '{MessageStatus.QUEUED.value}';
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';
+-- Serves both group probes: older unfinished rows, and dead rows that halt the group.
+CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_state ON {{table_name}} (group_key, status, id) WHERE group_key IS NOT NULL AND status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}', '{MessageStatus.DEAD.value}');
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_expire_at ON {{table_name}} (expire_at) WHERE expire_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_active_heartbeat ON {{table_name}} (heartbeat_at) WHERE status = '{MessageStatus.ACTIVE.value}';
 """  # noqa: E501
 
 INSERT_MESSAGE_QUERY = """
 INSERT INTO {table_name}
-    (task_id, task_name, message, labels, group_key, expire_at, scheduled_at)
-VALUES ($1, $2, $3, $4, $5, NULL, {scheduled_at})
+    (task_id, task_name, message, labels, group_key, ordered, expire_at, scheduled_at)
+VALUES ($1, $2, $3, $4, $5, $6, NULL, {scheduled_at})
 RETURNING id
 """
 
@@ -66,28 +73,45 @@ SELECT_MESSAGE_QUERY = "SELECT * FROM {table_name} WHERE id = $1"
 
 DELETE_MESSAGE_QUERY = "DELETE FROM {table_name} WHERE id = $1"
 
-# Two locks, two jobs. Advisory-xact lock (group_key) = group mutex: makes
-# "no active row for this group? then claim it" atomic across workers, which the
-# NOT IN subquery alone can't under READ COMMITTED. FOR UPDATE SKIP LOCKED = don't
-# double-claim a row + let workers fan out. Ungrouped rows skip the advisory try.
-# 64-bit key via hashtextextended(group_key, $1): $1 is the keyspace seed, so distinct
-# groups (and keyspaces) almost never collide. Stamp heartbeat at claim (first beat).
+# Claims one message. Guards: group mutex (one active row per group_key), advisory
+# lock ($1 = keyspace seed, closes the check-and-set race the mutex alone loses under
+# READ COMMITTED), head-of-line and dead-halt (both opt-in via `ordered`, both id-
+# correlated so they probe an index rather than hash), FOR UPDATE SKIP LOCKED (one
+# claimer per row). Claim order within a group is by id; heartbeat stamped at claim.
 DEQUEUE_MESSAGE_QUERY = f"""
 WITH next_message AS (
-    SELECT id
-    FROM {{table_name}}
-    WHERE status = '{MessageStatus.QUEUED.value}'
-      AND scheduled_at <= NOW()
-      AND (expire_at IS NULL OR expire_at > NOW())
-      AND (group_key IS NULL OR group_key NOT IN (
-          SELECT DISTINCT group_key
-          FROM {{table_name}}
-          WHERE status = '{MessageStatus.ACTIVE.value}'
-            AND group_key IS NOT NULL
+    SELECT m.id
+    FROM {{table_name}} m
+    WHERE m.status = '{MessageStatus.QUEUED.value}'
+      AND m.scheduled_at <= NOW()
+      AND (m.expire_at IS NULL OR m.expire_at > NOW())
+      AND (m.group_key IS NULL OR (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM {{table_name}} a
+                  WHERE a.group_key = m.group_key
+                    AND a.status = '{MessageStatus.ACTIVE.value}'
+              )
+              AND (NOT m.ordered OR (
+                  NOT EXISTS (
+                      SELECT 1
+                      FROM {{table_name}} o
+                      WHERE o.group_key = m.group_key
+                        AND o.status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}')
+                        AND o.id < m.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {{table_name}} d
+                      WHERE d.group_key = m.group_key
+                        AND d.status = '{MessageStatus.DEAD.value}'
+                        AND d.id < m.id
+                  )
+              ))
       ))
-      AND (group_key IS NULL
-           OR pg_try_advisory_xact_lock(hashtextextended(group_key, $1)))
-    ORDER BY scheduled_at, created_at
+      AND (m.group_key IS NULL
+           OR pg_try_advisory_xact_lock(hashtextextended(m.group_key, $1)))
+    ORDER BY m.scheduled_at, m.id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
@@ -96,7 +120,7 @@ SET status = '{MessageStatus.ACTIVE.value}', heartbeat_at = NOW()
 FROM next_message
 WHERE {{table_name}}.id = next_message.id
 RETURNING {{table_name}}.*
-"""
+"""  # noqa: E501
 
 # Batched liveness refresh for this process's in-flight ids. status guard avoids
 # resurrecting a row already swept back to queued.

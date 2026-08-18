@@ -14,6 +14,7 @@ The broker now uses an enhanced database schema with additional columns:
 - `expire_at`: Automatic cleanup timestamp
 - `group_key`: For coordinating related messages
 - `retry_count`: Tracks retry attempts
+- `ordered`: Opt-in FIFO within a `group_key` (defaults to false, i.e. mutex only)
 
 **Migration Required**: If you have existing messages in your database, you'll need to either:
 1. Drop and recreate the messages table (losing existing messages)

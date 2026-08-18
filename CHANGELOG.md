@@ -7,6 +7,7 @@
 * Add atomic message claiming via `FOR UPDATE SKIP LOCKED` to prevent duplicate processing
 * Add message states (queued, active, completed) for better tracking
 * Add group-based job coordination to prevent concurrent execution of related tasks
+* Add opt-in FIFO within a group via the `ordered` label: an ordered message waits for every older unfinished message in its group, so delayed or retrying messages are not overtaken
 * Add message TTL support for automatic cleanup of completed messages
 * Add automatic sweeping of stuck messages back to queue
 * Add connection health checks and automatic reconnection

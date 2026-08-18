@@ -127,6 +127,19 @@ class AsyncpgBroker(AsyncBroker):
                 return int(ttl)
         return -1
 
+    @staticmethod
+    def _resolve_ordered(labels: dict[str, Any]) -> bool:
+        """Opt-in FIFO. Strict: a typo must not silently unorder a queue."""
+        value = labels.get("ordered")
+        if value is None or isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, str) and (text := value.strip().lower()) in {
+            "true",
+            "false",
+        }:
+            return text == "true"
+        raise ValueError(f"`ordered` label must be a bool, got {value!r}")
+
     @override
     async def startup(self) -> None:
         """Initialize the broker."""
@@ -219,6 +232,9 @@ class AsyncpgBroker(AsyncBroker):
 
         async with self.write_pool.acquire() as conn:
             group_key = message.labels.get("group_key")
+            ordered = self._resolve_ordered(message.labels)
+            if ordered and group_key is None:
+                raise ValueError("`ordered` label requires a `group_key`")
             delay_value = message.labels.get("delay")
 
             if delay_value is not None:
@@ -237,6 +253,7 @@ class AsyncpgBroker(AsyncBroker):
                 message.message.decode(),
                 json.dumps(message.labels),
                 group_key,
+                ordered,
             )
 
             if result is None:
