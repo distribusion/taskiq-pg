@@ -15,12 +15,11 @@ import asyncpg
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 from typing_extensions import override
 
+from taskiq_pg import schema
 from taskiq_pg.broker_queries import (
-    CLAIM_FUNCTION_QUERY,
     CLAIM_MESSAGE_QUERY,
     CLEANUP_EXPIRED_QUERY,
     COMPLETE_MESSAGE_QUERY,
-    CREATE_TABLE_QUERY,
     HEARTBEAT_MESSAGES_QUERY,
     INSERT_MESSAGE_QUERY,
     SELECT_MESSAGE_QUERY,
@@ -96,8 +95,7 @@ class AsyncpgBroker(AsyncBroker):
         self.enable_sweeping: bool = enable_sweeping
         self.sweep_interval: int = sweep_interval
         self.heartbeat_interval: int = heartbeat_interval
-        self.table_name_safe: str = table_name.replace('"', "").replace(" ", "_")
-        self.claim_fn: str = f"{self.table_name_safe}_claim"
+        self.claim_fn: str = schema.claim_fn_name(table_name)
 
         self.read_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
         self.dequeue_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
@@ -164,16 +162,7 @@ class AsyncpgBroker(AsyncBroker):
             raise RuntimeError(msg)
 
         async with self.write_pool.acquire() as conn:
-            _ = await conn.execute(
-                CREATE_TABLE_QUERY.format(
-                    table_name=self.table_name, table_name_safe=self.table_name_safe
-                )
-            )
-            _ = await conn.execute(
-                CLAIM_FUNCTION_QUERY.format(
-                    table_name=self.table_name, claim_fn=self.claim_fn
-                )
-            )
+            await schema.ensure(conn, self.table_name, self.job_lock_keyspace)
 
         await self.read_conn.add_listener(self.channel_name, self._notification_handler)
         self._queue = asyncio.Queue()
