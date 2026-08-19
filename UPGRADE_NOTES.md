@@ -33,6 +33,10 @@ dequeues through it. The connecting role needs `CREATE` on the schema. It return
 `BIGINT`, not the table's row type, so it is not a dependency of the table and
 `DROP TABLE` still works; startup recreates it with `CREATE OR REPLACE`.
 
+Because there is no dependency, `DROP TABLE` leaves the function behind. Drop it
+explicitly with `DROP FUNCTION IF EXISTS <table_name>_claim(BIGINT)` if you create
+tables dynamically, or the catalog accumulates one function per table.
+
 ### API Changes
 
 The `AsyncpgBroker` constructor now accepts additional parameters:

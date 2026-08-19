@@ -49,6 +49,9 @@ async def _broker() -> AsyncpgBroker:
 async def _drop(broker: AsyncpgBroker) -> None:
     assert broker.write_pool is not None
     await broker.write_pool.execute(f"DROP TABLE IF EXISTS {broker.table_name}")
+    await broker.write_pool.execute(
+        f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
+    )
     await broker.shutdown()
 
 

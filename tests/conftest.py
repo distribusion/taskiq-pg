@@ -88,7 +88,9 @@ async def asyncpg_broker(
     await broker.startup()
     yield broker
     assert broker.write_pool
+    await broker.write_pool.execute(f"DROP TABLE {postgres_table}")
+    # DROP TABLE does not take the claim function with it
     await broker.write_pool.execute(
-        f"DROP TABLE {postgres_table}",
+        f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
     )
     await broker.shutdown()

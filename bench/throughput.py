@@ -292,6 +292,9 @@ async def _run(args: argparse.Namespace) -> int:
         if proc is not None:
             await _teardown_worker(proc)
         await broker.write_pool.execute(f"DROP TABLE IF EXISTS {TABLE}")
+        await broker.write_pool.execute(
+            f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
+        )
         await broker.shutdown()
 
 
