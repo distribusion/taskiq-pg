@@ -20,6 +20,23 @@ The broker now uses an enhanced database schema with additional columns:
 1. Drop and recreate the messages table (losing existing messages)
 2. Manually add the new columns with appropriate defaults
 
+### Retired Index
+
+`idx_<table>_status_scheduled` is dropped at startup. `idx_<table>_scheduled_id`
+supersedes it — `status` is constant inside a partial index on `status`, and the
+dequeue orders by `(scheduled_at, id)`.
+
+### New Database Object
+
+The broker creates a `<table_name>_claim(BIGINT)` plpgsql function at startup and
+dequeues through it. The connecting role needs `CREATE` on the schema. It returns
+`BIGINT`, not the table's row type, so it is not a dependency of the table and
+`DROP TABLE` still works; startup recreates it with `CREATE OR REPLACE`.
+
+Because there is no dependency, `DROP TABLE` leaves the function behind. Drop it
+explicitly with `DROP FUNCTION IF EXISTS <table_name>_claim(BIGINT)` if you create
+tables dynamically, or the catalog accumulates one function per table.
+
 ### API Changes
 
 The `AsyncpgBroker` constructor now accepts additional parameters:

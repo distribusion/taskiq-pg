@@ -11,7 +11,6 @@ from taskiq.utils import maybe_awaitable
 from taskiq_pg import AsyncpgBroker
 from taskiq_pg.broker_queries import (
     COMPLETE_MESSAGE_QUERY,
-    DEQUEUE_MESSAGE_QUERY,
     HEARTBEAT_MESSAGES_QUERY,
 )
 
@@ -616,7 +615,6 @@ async def test_concurrent_claim_exclusivity(asyncpg_broker: AsyncpgBroker) -> No
     Mirrors the multi-worker bench: FOR UPDATE SKIP LOCKED must hand each message
     to exactly one consumer.
     """
-    tbl = asyncpg_broker.table_name
     backlog = 60
     for _ in range(backlog):
         await asyncpg_broker.kick(
@@ -625,15 +623,12 @@ async def test_concurrent_claim_exclusivity(asyncpg_broker: AsyncpgBroker) -> No
             )
         )
 
-    dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
-    keyspace = asyncpg_broker.job_lock_keyspace
-
     async def drain(claimed: list[int]) -> None:
         conn = await asyncpg.connect(asyncpg_broker.dsn)
         try:
             while True:
                 async with conn.transaction():
-                    row = await conn.fetchrow(dequeue_sql, keyspace)
+                    row = await asyncpg_broker._claim_on(conn)
                 if row is None:
                     return
                 claimed.append(int(row["id"]))
@@ -665,7 +660,6 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
     B's pg_try_advisory_xact_lock fails while A's txn holds it, so B claims nothing.
     """
     tbl = asyncpg_broker.table_name
-    keyspace = asyncpg_broker.job_lock_keyspace
     group_key = "grp_race"
 
     for _ in range(2):
@@ -678,7 +672,6 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
             )
         )
 
-    dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
     conn_a = await asyncpg.connect(asyncpg_broker.dsn)
     conn_b = await asyncpg.connect(asyncpg_broker.dsn)
     try:
@@ -688,12 +681,12 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
         await tx_b.start()
 
         # A claims a row of the group and holds the advisory lock (txn still open).
-        row_a = await conn_a.fetchrow(dequeue_sql, keyspace)
+        row_a = await asyncpg_broker._claim_on(conn_a)
         assert row_a is not None
 
         # B runs while A is uncommitted: A's row still looks 'queued' to B, but the
         # group's advisory lock is held -> B must claim nothing.
-        row_b = await conn_b.fetchrow(dequeue_sql, keyspace)
+        row_b = await asyncpg_broker._claim_on(conn_b)
         assert row_b is None
 
         await tx_a.commit()
@@ -701,7 +694,7 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
 
         # Group now has an active row -> the NOT IN(active) guard keeps the second
         # queued row parked even after A's lock is released.
-        row_b2 = await conn_b.fetchrow(dequeue_sql, keyspace)
+        row_b2 = await asyncpg_broker._claim_on(conn_b)
         assert row_b2 is None
 
         # Complete A's row; the group frees and the second row becomes claimable.
@@ -712,7 +705,7 @@ async def test_group_mutex_across_connections(asyncpg_broker: AsyncpgBroker) -> 
             row_a["id"],
         )
         async with conn_b.transaction():
-            row_b3 = await conn_b.fetchrow(dequeue_sql, keyspace)
+            row_b3 = await asyncpg_broker._claim_on(conn_b)
         assert row_b3 is not None
         assert row_b3["id"] != row_a["id"]
     finally:
@@ -731,7 +724,6 @@ async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> 
     double-claimed.
     """
     tbl = asyncpg_broker.table_name
-    keyspace = asyncpg_broker.job_lock_keyspace
     group_key = "grp_concurrent"
     backlog = 30
     workers = 8
@@ -746,7 +738,6 @@ async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> 
             )
         )
 
-    dequeue_sql = DEQUEUE_MESSAGE_QUERY.format(table_name=tbl)
     complete_sql = COMPLETE_MESSAGE_QUERY.format(table_name=tbl)
     ttl = asyncpg_broker.message_ttl
 
@@ -760,7 +751,7 @@ async def test_group_mutex_concurrent_workers(asyncpg_broker: AsyncpgBroker) -> 
         try:
             while True:
                 async with conn.transaction():
-                    row = await conn.fetchrow(dequeue_sql, keyspace)
+                    row = await asyncpg_broker._claim_on(conn)
                 if row is None:
                     # Either drained, or the single active slot is taken. Distinguish:
                     # if any row is still queued, back off and retry; else stop.
@@ -808,6 +799,15 @@ async def _kick_group(
             task_name=name,
             message=name.encode(),
             labels=labels,
+        )
+    )
+
+
+async def _kick(broker: AsyncpgBroker, name: str, group_key: Optional[str]) -> None:
+    labels = {} if group_key is None else {"group_key": group_key}
+    await broker.kick(
+        BrokerMessage(
+            task_id=uuid.uuid4().hex, task_name=name, message=b"x", labels=labels
         )
     )
 
@@ -1041,6 +1041,63 @@ async def test_ordered_label_validation(asyncpg_broker: AsyncpgBroker) -> None:
     assert AsyncpgBroker._resolve_ordered({"ordered": "True"}) is True
     assert AsyncpgBroker._resolve_ordered({"ordered": "false"}) is False
     assert AsyncpgBroker._resolve_ordered({}) is False
+
+
+@pytest.mark.anyio
+async def test_busy_group_does_not_block_ungrouped(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """Ungrouped rows skip the mutex and the advisory lock."""
+    await _kick(asyncpg_broker, "grouped", "g")
+    await _kick(asyncpg_broker, "ungrouped", None)
+
+    first = await asyncpg_broker._dequeue_message()
+    assert first is not None
+    assert first["group_key"] == "g"
+
+    second = await asyncpg_broker._dequeue_message()
+    assert second is not None
+    assert second["group_key"] is None
+
+
+@pytest.mark.anyio
+async def test_claim_returns_none_when_every_group_is_busy(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """Rejected candidates must be skipped, not re-picked: a stuck cursor spins."""
+    for group_key in ("a", "b"):
+        for _ in range(2):
+            await _kick(asyncpg_broker, "t", group_key)
+
+    claimed = [await asyncpg_broker._dequeue_message() for _ in range(2)]
+    assert {row["group_key"] for row in claimed if row is not None} == {"a", "b"}
+
+    # wait_for turns a spin inside the claim loop into a failure instead of a hang
+    assert await asyncio.wait_for(asyncpg_broker._dequeue_message(), timeout=10) is None
+
+
+@pytest.mark.anyio
+async def test_group_with_held_advisory_lock_is_skipped(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A group whose advisory lock is held elsewhere is passed over, not waited on."""
+    await _kick(asyncpg_broker, "locked", "locked_group")
+    await _kick(asyncpg_broker, "free", "free_group")
+
+    holder = await asyncpg.connect(asyncpg_broker.dsn)
+    try:
+        await holder.execute(
+            "SELECT pg_advisory_lock(hashtextextended($1, $2))",
+            "locked_group",
+            asyncpg_broker.job_lock_keyspace,
+        )
+        row = await asyncpg_broker._dequeue_message()
+        assert row is not None
+        assert row["group_key"] == "free_group"
+        assert await asyncpg_broker._dequeue_message() is None
+    finally:
+        await holder.execute("SELECT pg_advisory_unlock_all()")
+        await holder.close()
 
 
 @pytest.mark.anyio

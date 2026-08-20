@@ -15,13 +15,14 @@ import asyncpg
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 from typing_extensions import override
 
+from taskiq_pg import schema
 from taskiq_pg.broker_queries import (
+    CLAIM_MESSAGE_QUERY,
     CLEANUP_EXPIRED_QUERY,
     COMPLETE_MESSAGE_QUERY,
-    CREATE_TABLE_QUERY,
-    DEQUEUE_MESSAGE_QUERY,
     HEARTBEAT_MESSAGES_QUERY,
     INSERT_MESSAGE_QUERY,
+    SELECT_MESSAGE_QUERY,
     SWEEP_MESSAGES_QUERY,
 )
 from taskiq_pg.status import MessageStatus
@@ -94,6 +95,7 @@ class AsyncpgBroker(AsyncBroker):
         self.enable_sweeping: bool = enable_sweeping
         self.sweep_interval: int = sweep_interval
         self.heartbeat_interval: int = heartbeat_interval
+        self.claim_fn: str = schema.claim_fn_name(table_name)
 
         self.read_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
         self.dequeue_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
@@ -160,13 +162,7 @@ class AsyncpgBroker(AsyncBroker):
             raise RuntimeError(msg)
 
         async with self.write_pool.acquire() as conn:
-            table_name_safe = self.table_name.replace('"', "").replace(" ", "_")
-            _ = await conn.execute(
-                CREATE_TABLE_QUERY.format(
-                    table_name=self.table_name,
-                    table_name_safe=table_name_safe,
-                )
-            )
+            await schema.ensure(conn, self.table_name, self.job_lock_keyspace)
 
         await self.read_conn.add_listener(self.channel_name, self._notification_handler)
         self._queue = asyncio.Queue()
@@ -339,9 +335,22 @@ class AsyncpgBroker(AsyncBroker):
                 logger.exception(f"Error processing message: {e}")
                 continue
 
+    async def _claim_on(
+        self, conn: "asyncpg.Connection[asyncpg.Record]"
+    ) -> Optional[asyncpg.Record]:
+        """Claim one message on `conn`, in the caller's txn. Two statements."""
+        claimed_id = await conn.fetchval(
+            CLAIM_MESSAGE_QUERY.format(claim_fn=self.claim_fn), self.job_lock_keyspace
+        )
+        if claimed_id is None:
+            return None
+        return await conn.fetchrow(
+            SELECT_MESSAGE_QUERY.format(table_name=self.table_name), claimed_id
+        )
+
     async def _dequeue_message(self) -> Optional[asyncpg.Record]:
         """
-        Dequeue a message using FOR UPDATE SKIP LOCKED.
+        Claim one message on the dedicated dequeue connection.
 
         Returns the message row if one is available, None otherwise.
         """
@@ -351,11 +360,8 @@ class AsyncpgBroker(AsyncBroker):
         async with self._dequeue_lock:
             try:
                 await self._ensure_connection_healthy()
-                dequeue_query = DEQUEUE_MESSAGE_QUERY.format(table_name=self.table_name)
                 async with self.dequeue_conn.transaction():
-                    return await self.dequeue_conn.fetchrow(
-                        dequeue_query, self.job_lock_keyspace
-                    )
+                    return await self._claim_on(self.dequeue_conn)
             except Exception as e:
                 logger.error(f"Error dequeuing message: {e}")
                 return None

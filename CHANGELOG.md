@@ -15,6 +15,10 @@
 * Implement `FOR UPDATE SKIP LOCKED` for efficient concurrent dequeuing
 * Add configurable sweep interval and stuck message timeout
 
+### Bug Fixes
+
+* Fix the group mutex admitting two messages of a group at once: the mutex is re-checked under the advisory lock, in a statement of its own
+
 ### Performance Improvements
 
 * Use optimized indexes for efficient dequeuing operations

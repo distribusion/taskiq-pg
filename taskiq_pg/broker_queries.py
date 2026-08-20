@@ -52,7 +52,23 @@ BEGIN
     END IF;
 END
 $do$;
-CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_status_scheduled ON {{table_name}} (status, scheduled_at) WHERE status = '{MessageStatus.QUEUED.value}';
+-- Superseded by _scheduled_id: status is constant inside a partial index on status.
+-- Matched by indrelid, not by name: a same-named index on another table or schema is
+-- not ours to drop, and an unqualified DROP would resolve through search_path.
+DO $do$
+DECLARE
+    victim oid;
+BEGIN
+    SELECT i.indexrelid INTO victim
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE i.indrelid = to_regclass('{{table_name}}')
+      AND c.relname = 'idx_{{table_name_safe}}_status_scheduled';
+    IF victim IS NOT NULL THEN
+        EXECUTE format('DROP INDEX %s', victim::regclass);
+    END IF;
+END
+$do$;
 -- ORDER BY (scheduled_at, id) needs the tiebreak in the index or it sorts per call.
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_scheduled_id ON {{table_name}} (scheduled_at, id) WHERE status = '{MessageStatus.QUEUED.value}';
 CREATE INDEX IF NOT EXISTS idx_{{table_name_safe}}_group_key ON {{table_name}} (group_key) WHERE group_key IS NOT NULL AND status = '{MessageStatus.ACTIVE.value}';
@@ -73,54 +89,83 @@ SELECT_MESSAGE_QUERY = "SELECT * FROM {table_name} WHERE id = $1"
 
 DELETE_MESSAGE_QUERY = "DELETE FROM {table_name} WHERE id = $1"
 
-# Claims one message. Guards: group mutex (one active row per group_key), advisory
-# lock ($1 = keyspace seed, closes the check-and-set race the mutex alone loses under
-# READ COMMITTED), head-of-line and dead-halt (both opt-in via `ordered`, both id-
-# correlated so they probe an index rather than hash), FOR UPDATE SKIP LOCKED (one
-# claimer per row). Claim order within a group is by id; heartbeat stamped at claim.
-DEQUEUE_MESSAGE_QUERY = f"""
-WITH next_message AS (
-    SELECT m.id
-    FROM {{table_name}} m
-    WHERE m.status = '{MessageStatus.QUEUED.value}'
-      AND m.scheduled_at <= NOW()
-      AND (m.expire_at IS NULL OR m.expire_at > NOW())
-      AND (m.group_key IS NULL OR (
+# Claims one message, returns its id. $1 = advisory keyspace seed.
+# Mutex re-checked after the advisory lock, as its own statement: plpgsql statements
+# take a fresh snapshot each under READ COMMITTED, so it sees rivals' committed claims.
+# Duplicate NOT EXISTS: different snapshots. Head-of-line and dead-halt (opt-in via
+# `ordered`) need no re-check -- a stale read of either can only over-block.
+# SKIP LOCKED fans workers out; cursor skips rejected candidates. BIGINT return, not
+# SETOF table: composite type blocks DROP TABLE.
+CLAIM_FUNCTION_QUERY = f"""
+CREATE OR REPLACE FUNCTION {{claim_fn}}(p_keyspace BIGINT)
+RETURNS BIGINT
+LANGUAGE plpgsql AS $claim$
+DECLARE
+    cand RECORD;
+    cur_sched TIMESTAMPTZ := '-infinity';
+    cur_id BIGINT := 0;
+BEGIN
+    LOOP
+        SELECT m.id, m.group_key, m.scheduled_at
+        INTO cand
+        FROM {{table_name}} m
+        WHERE m.status = '{MessageStatus.QUEUED.value}'
+          AND m.scheduled_at <= NOW()
+          AND (m.expire_at IS NULL OR m.expire_at > NOW())
+          AND (m.scheduled_at, m.id) > (cur_sched, cur_id)
+          AND (m.group_key IS NULL OR (
               NOT EXISTS (
-                  SELECT 1
-                  FROM {{table_name}} a
-                  WHERE a.group_key = m.group_key
-                    AND a.status = '{MessageStatus.ACTIVE.value}'
+                  SELECT 1 FROM {{table_name}} a
+                  WHERE a.group_key = m.group_key AND a.status = '{MessageStatus.ACTIVE.value}'
               )
               AND (NOT m.ordered OR (
                   NOT EXISTS (
-                      SELECT 1
-                      FROM {{table_name}} o
-                      WHERE o.group_key = m.group_key
+                      SELECT 1 FROM {{table_name}} o
+                      WHERE o.group_key = m.group_key AND o.id < m.id
                         AND o.status IN ('{MessageStatus.QUEUED.value}', '{MessageStatus.ACTIVE.value}')
-                        AND o.id < m.id
                   )
                   AND NOT EXISTS (
-                      SELECT 1
-                      FROM {{table_name}} d
-                      WHERE d.group_key = m.group_key
+                      SELECT 1 FROM {{table_name}} d
+                      WHERE d.group_key = m.group_key AND d.id < m.id
                         AND d.status = '{MessageStatus.DEAD.value}'
-                        AND d.id < m.id
                   )
               ))
-      ))
-      AND (m.group_key IS NULL
-           OR pg_try_advisory_xact_lock(hashtextextended(m.group_key, $1)))
-    ORDER BY m.scheduled_at, m.id
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE {{table_name}}
-SET status = '{MessageStatus.ACTIVE.value}', heartbeat_at = NOW()
-FROM next_message
-WHERE {{table_name}}.id = next_message.id
-RETURNING {{table_name}}.*
+          ))
+        ORDER BY m.scheduled_at, m.id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED;
+
+        EXIT WHEN NOT FOUND;
+        cur_sched := cand.scheduled_at;
+        cur_id := cand.id;
+
+        IF cand.group_key IS NOT NULL THEN
+            IF NOT pg_try_advisory_xact_lock(hashtextextended(cand.group_key, p_keyspace)) THEN
+                CONTINUE;
+            END IF;
+            IF EXISTS (
+                SELECT 1 FROM {{table_name}} a
+                WHERE a.group_key = cand.group_key AND a.status = '{MessageStatus.ACTIVE.value}'
+            ) THEN
+                CONTINUE;
+            END IF;
+        END IF;
+
+        -- Row is ours via FOR UPDATE; status guard is the backstop.
+        UPDATE {{table_name}}
+        SET status = '{MessageStatus.ACTIVE.value}', heartbeat_at = NOW()
+        WHERE id = cand.id AND status = '{MessageStatus.QUEUED.value}';
+        IF FOUND THEN
+            RETURN cand.id;
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END
+$claim$;
 """  # noqa: E501
+
+# Read in a LATER statement: an enclosing statement's snapshot predates the claim.
+CLAIM_MESSAGE_QUERY = "SELECT {claim_fn}($1)"
 
 # Batched liveness refresh for this process's in-flight ids. status guard avoids
 # resurrecting a row already swept back to queued.
