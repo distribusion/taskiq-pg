@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS {{table_name}} (
     lock_key SERIAL NOT NULL,
     expire_at TIMESTAMP WITH TIME ZONE,
     group_key VARCHAR,
-    retry_count INTEGER DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
     heartbeat_at TIMESTAMP WITH TIME ZONE,
     ordered BOOLEAN NOT NULL DEFAULT FALSE
 );
@@ -29,7 +29,7 @@ ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT '
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS lock_key SERIAL NOT NULL;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS expire_at TIMESTAMP WITH TIME ZONE;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS group_key VARCHAR;
-ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
+ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE;
 -- Opt-in FIFO. Metadata-only on PG11+; existing rows read false, i.e. mutex-only.
 ALTER TABLE {{table_name}} ADD COLUMN IF NOT EXISTS ordered BOOLEAN NOT NULL DEFAULT FALSE;
@@ -152,8 +152,11 @@ BEGIN
         END IF;
 
         -- Row is ours via FOR UPDATE; status guard is the backstop.
+        -- retry_count counts deliveries, so it is bumped here and nowhere else:
+        -- whatever ended the previous attempt, crash or exception, costs the same.
         UPDATE {{table_name}}
-        SET status = '{MessageStatus.ACTIVE.value}', heartbeat_at = NOW()
+        SET status = '{MessageStatus.ACTIVE.value}', heartbeat_at = NOW(),
+            retry_count = retry_count + 1
         WHERE id = cand.id AND status = '{MessageStatus.QUEUED.value}';
         IF FOUND THEN
             RETURN cand.id;
@@ -183,8 +186,9 @@ WHERE id = $2 AND status = '{MessageStatus.ACTIVE.value}'
 """  # noqa: E501
 
 # Reclaim rows whose lease went stale (worker presumed dead). $1: timeout secs,
-# $2: max_retry_attempts. A row that has burned its attempts is parked in 'dead'
-# (terminal, excluded from dequeue) instead of looping forever.
+# $2: max_retry_attempts. Reads the attempt count, never bumps it -- the claim does
+# that. A row that has burned its attempts is parked in 'dead' (terminal, excluded
+# from dequeue) instead of looping forever.
 SWEEP_MESSAGES_QUERY = f"""
 WITH stuck_messages AS (
     SELECT id
@@ -197,10 +201,9 @@ WITH stuck_messages AS (
 )
 UPDATE {{table_name}}
 SET status = CASE
-        WHEN retry_count + 1 >= $2::INTEGER THEN '{MessageStatus.DEAD.value}'
+        WHEN retry_count >= $2::INTEGER THEN '{MessageStatus.DEAD.value}'
         ELSE '{MessageStatus.QUEUED.value}'
-    END,
-    retry_count = retry_count + 1
+    END
 FROM stuck_messages
 WHERE {{table_name}}.id = stuck_messages.id
 RETURNING {{table_name}}.id, {{table_name}}.status
