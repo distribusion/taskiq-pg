@@ -15,6 +15,10 @@
 * Implement `FOR UPDATE SKIP LOCKED` for efficient concurrent dequeuing
 * Add configurable sweep interval and stuck message timeout
 
+### Breaking Changes
+
+* Count attempts at claim time: `retry_count` is bumped when a message is claimed rather than when the sweeper reclaims it, so worker crashes and task failures share one budget and `max_retry_attempts` bounds attempts rather than retries
+
 ### Bug Fixes
 
 * Fix the group mutex admitting two messages of a group at once: the mutex is re-checked under the advisory lock, in a statement of its own

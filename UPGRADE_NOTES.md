@@ -13,12 +13,19 @@ The broker now uses an enhanced database schema with additional columns:
 - `lock_key`: Vestigial. Retained for rollout compatibility; claiming uses `FOR UPDATE SKIP LOCKED`, not advisory locks
 - `expire_at`: Automatic cleanup timestamp
 - `group_key`: For coordinating related messages
-- `retry_count`: Tracks retry attempts
+- `retry_count`: Counts deliveries. Bumped by the claim, so a crashed attempt and a failed one draw on the same budget
 - `ordered`: Opt-in FIFO within a `group_key` (defaults to false, i.e. mutex only)
 
 **Migration Required**: If you have existing messages in your database, you'll need to either:
 1. Drop and recreate the messages table (losing existing messages)
 2. Manually add the new columns with appropriate defaults
+
+### Attempt Counting
+
+`retry_count` is incremented when a message is claimed, not when it fails or when the
+sweeper reclaims it. One counter covers every reason an attempt ended, and
+`max_retry_attempts` bounds attempts rather than retries — a limit of 5 allows 5
+executions, and a message that succeeds first time ends at 1.
 
 ### Retired Index
 
