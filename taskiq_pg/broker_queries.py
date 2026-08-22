@@ -170,6 +170,29 @@ $claim$;
 # Read in a LATER statement: an enclosing statement's snapshot predates the claim.
 CLAIM_MESSAGE_QUERY = "SELECT {claim_fn}($1)"
 
+# Hand a delivery back without moving it: same id, same place in its group. $2 is the
+# attempt count the caller was given at claim; a worker whose row was reclaimed and
+# handed to someone else sees a stale count and updates nothing. The next claim counts
+# the new attempt, so this must not touch retry_count.
+RETRY_IN_PLACE_QUERY = f"""
+UPDATE {{table_name}}
+SET status = '{MessageStatus.QUEUED.value}',
+    scheduled_at = NOW() + ($3::DOUBLE PRECISION * INTERVAL '1 second'),
+    heartbeat_at = NULL
+WHERE id = $1
+  AND status = '{MessageStatus.ACTIVE.value}'
+  AND retry_count = $2::INTEGER
+"""
+
+# Terminal. Fenced like RETRY_IN_PLACE_QUERY.
+MARK_DEAD_QUERY = f"""
+UPDATE {{table_name}}
+SET status = '{MessageStatus.DEAD.value}'
+WHERE id = $1
+  AND status = '{MessageStatus.ACTIVE.value}'
+  AND retry_count = $2::INTEGER
+"""
+
 # Batched liveness refresh for this process's in-flight ids. status guard avoids
 # resurrecting a row already swept back to queued.
 HEARTBEAT_MESSAGES_QUERY = f"""
@@ -186,9 +209,11 @@ WHERE id = $2 AND status = '{MessageStatus.ACTIVE.value}'
 """  # noqa: E501
 
 # Reclaim rows whose lease went stale (worker presumed dead). $1: timeout secs,
-# $2: max_retry_attempts. Reads the attempt count, never bumps it -- the claim does
-# that. A row that has burned its attempts is parked in 'dead' (terminal, excluded
-# from dequeue) instead of looping forever.
+# $2: max_retry_attempts fallback. Reads the attempt count, never bumps it -- the
+# claim does that. A row that has burned its attempts is parked in 'dead' (terminal,
+# excluded from dequeue) instead of looping forever. The per-message `max_retries`
+# label wins where it parses as an integer; negative means retry forever. JSONB per
+# row is fine here: at most 100 rows a sweep, unlike the claim's candidate scan.
 SWEEP_MESSAGES_QUERY = f"""
 WITH stuck_messages AS (
     SELECT id
@@ -198,14 +223,25 @@ WITH stuck_messages AS (
     ORDER BY heartbeat_at
     LIMIT 100
     FOR UPDATE SKIP LOCKED
+),
+capped AS (
+    SELECT m.id,
+           CASE WHEN m.labels->>'max_retries' ~ '^-?\\d+$'
+                THEN (m.labels->>'max_retries')::INTEGER
+                ELSE $2::INTEGER
+           END AS cap,
+           m.retry_count
+    FROM {{table_name}} m
+    JOIN stuck_messages s ON s.id = m.id
 )
 UPDATE {{table_name}}
 SET status = CASE
-        WHEN retry_count >= $2::INTEGER THEN '{MessageStatus.DEAD.value}'
+        WHEN capped.cap >= 0 AND capped.retry_count >= capped.cap
+            THEN '{MessageStatus.DEAD.value}'
         ELSE '{MessageStatus.QUEUED.value}'
     END
-FROM stuck_messages
-WHERE {{table_name}}.id = stuck_messages.id
+FROM capped
+WHERE {{table_name}}.id = capped.id
 RETURNING {{table_name}}.id, {{table_name}}.status
 """
 
