@@ -247,10 +247,12 @@ async def _kick_many(
     return time.monotonic() - start
 
 
-async def _last_completion() -> object:
-    return await broker.write_pool.fetchval(
-        f"SELECT max(expire_at) FROM {TABLE} WHERE expire_at IS NOT NULL"
+async def _completion_mark() -> tuple[object, int]:
+    row = await broker.write_pool.fetchrow(
+        f"SELECT (SELECT max(expire_at) FROM {TABLE} WHERE expire_at IS NOT NULL) "
+        f"AS done, (SELECT count(*) FROM {TABLE} WHERE status = 'dead') AS dead"
     )
+    return row["done"], row["dead"]
 
 
 async def _produce(producers: list[AsyncpgBroker], args: argparse.Namespace) -> int:
@@ -283,7 +285,7 @@ async def _produce(producers: list[AsyncpgBroker], args: argparse.Namespace) -> 
 class _StallWatch:
     """Track the longest time work was outstanding while nothing completed.
 
-    Progress: a newer expire_at, or fewer outstanding rows (covers dead-lettering).
+    Progress: a newer expire_at, a new dead row, or fewer outstanding rows.
     """
 
     def __init__(self, stall_timeout: float) -> None:
@@ -292,13 +294,13 @@ class _StallWatch:
         self.stalls = 0
 
     async def run(self) -> None:
-        last_mark = await _last_completion()
+        last_mark = await _completion_mark()
         last_left = await _count_rows()
         last_progress = time.monotonic()
         stalled = False
         while True:
             await asyncio.sleep(0.1)
-            mark = await _last_completion()
+            mark = await _completion_mark()
             left = await _count_rows()
             now = time.monotonic()
             if left:
@@ -446,6 +448,9 @@ async def _run(args: argparse.Namespace) -> int:
     proc = None
     watcher = None
     try:
+        await broker.write_pool.execute(
+            f"CREATE INDEX ON {TABLE} (id) WHERE status = 'dead'"
+        )
         for producer in producers:
             await producer.startup()
         proc = await _spawn_worker(
