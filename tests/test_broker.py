@@ -1094,18 +1094,23 @@ async def test_producer_startup_skips_consumer_setup(
         await producer.shutdown()
 
 
+def _twin(broker: AsyncpgBroker) -> AsyncpgBroker:
+    """A second broker on the fixture's table and channel."""
+    return AsyncpgBroker(
+        dsn=broker.dsn,
+        channel_name=broker.channel_name,
+        table_name=broker.table_name,
+        job_lock_keyspace=broker.job_lock_keyspace,
+        enable_sweeping=False,
+    )
+
+
 @pytest.mark.anyio
 async def test_listen_starts_consumer_after_producer_startup(
     asyncpg_broker: AsyncpgBroker,
 ) -> None:
     """listen() after a non-worker startup works, as with run_receiver_task."""
-    late = AsyncpgBroker(
-        dsn=asyncpg_broker.dsn,
-        channel_name=asyncpg_broker.channel_name,
-        table_name=asyncpg_broker.table_name,
-        job_lock_keyspace=asyncpg_broker.job_lock_keyspace,
-        enable_sweeping=False,
-    )
+    late = _twin(asyncpg_broker)
     await late.startup()
     try:
         listener = asyncio.create_task(get_first_task(late))
@@ -1134,6 +1139,75 @@ async def test_listen_starts_consumer_after_producer_startup(
         assert late.read_conn is None
     finally:
         await late.shutdown()
+
+
+class _BlockingClose:
+    """Holds close() until released, so a consumer start can run inside it."""
+
+    def __init__(self, pool: "asyncpg.Pool[asyncpg.Record]") -> None:
+        self.pool = pool
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def close(self) -> None:
+        self.entered.set()
+        await self.release.wait()
+        await self.pool.close()
+
+
+@pytest.mark.anyio
+async def test_consumer_start_during_shutdown_is_rejected(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A consumer start while write_pool.close() runs opens nothing."""
+    late = _twin(asyncpg_broker)
+    await late.startup()
+    assert late.write_pool is not None
+    blocking = _BlockingClose(late.write_pool)
+    late.write_pool = blocking  # type: ignore[assignment]
+
+    stopping = asyncio.create_task(late.shutdown())
+    await blocking.entered.wait()
+    consumer = asyncio.create_task(late._start_consumer())
+    await asyncio.sleep(0)
+    blocking.release.set()
+    await stopping
+    with pytest.raises(ValueError):
+        await consumer
+
+    assert late.read_conn is None
+    assert late.dequeue_conn is None
+    assert late.write_pool is None
+    assert late._queue is None
+    assert late._heartbeat_task is None
+
+
+class _FailingClose:
+    async def close(self) -> None:
+        raise RuntimeError("close failed")
+
+
+@pytest.mark.anyio
+async def test_shutdown_closes_the_rest_when_one_close_fails(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A failing close keeps its handle for a retry and does not skip the others."""
+    late = _twin(asyncpg_broker)
+    late.is_worker_process = True
+    await late.startup()
+    real_read_conn = late.read_conn
+    assert real_read_conn is not None
+    late.read_conn = _FailingClose()  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="close failed"):
+            await late.shutdown()
+        assert isinstance(late.read_conn, _FailingClose)
+        assert late.dequeue_conn is None
+        assert late.write_pool is None
+        assert late._heartbeat_task is None
+        assert late._queue is None
+    finally:
+        await real_read_conn.close()
 
 
 @pytest.mark.anyio

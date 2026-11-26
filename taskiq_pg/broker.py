@@ -112,6 +112,7 @@ class AsyncpgBroker(AsyncBroker):
         self._inflight_ids: set[int] = set()  # ids this process must keep alive
         self._dequeue_lock: asyncio.Lock = asyncio.Lock()
         self._connection_lock: asyncio.Lock = asyncio.Lock()
+        self._closing: bool = False
 
     @property
     def dsn(self) -> str:
@@ -151,6 +152,7 @@ class AsyncpgBroker(AsyncBroker):
     @override
     async def startup(self) -> None:
         """Initialize the broker."""
+        self._closing = False
         try:
             await super().startup()
 
@@ -173,7 +175,7 @@ class AsyncpgBroker(AsyncBroker):
     async def _start_consumer(self) -> asyncio.Queue[str]:
         """Open listener and dequeue connections, and start worker tasks."""
         async with self._connection_lock:
-            if self.write_pool is None:
+            if self.write_pool is None or self._closing:
                 raise ValueError("Call startup before starting listening.")
             if self._queue is not None:
                 return self._queue
@@ -188,8 +190,6 @@ class AsyncpgBroker(AsyncBroker):
                 await read_conn.add_listener(
                     self.channel_name, self._notification_handler
                 )
-                if self.write_pool is None:
-                    raise ValueError("Broker shut down during listen startup.")
                 stack.pop_all()
             self.read_conn = read_conn
             self.dequeue_conn = dequeue_conn
@@ -201,20 +201,29 @@ class AsyncpgBroker(AsyncBroker):
     @override
     async def shutdown(self) -> None:
         """Close all connections on shutdown."""
-        try:
+        async with self._connection_lock, contextlib.AsyncExitStack() as stack:
+            self._closing = True
+            stack.callback(self._inflight_ids.clear)
+            stack.callback(setattr, self, "_queue", None)
+            for name in ("write_pool", "dequeue_conn", "read_conn"):
+                stack.push_async_callback(self._close_handle, name)
+            for name in ("_heartbeat_task", "_sweep_task"):
+                stack.push_async_callback(self._stop_task, name)
             await super().shutdown()
-            for task in (self._sweep_task, self._heartbeat_task):
-                if task is not None:
-                    _ = task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-            for resource in (self.read_conn, self.dequeue_conn, self.write_pool):
-                if resource is not None:
-                    await resource.close()
-        finally:
-            self.read_conn = self.dequeue_conn = self.write_pool = None
-            self._queue = self._sweep_task = self._heartbeat_task = None
-            self._inflight_ids.clear()
+
+    async def _close_handle(self, name: str) -> None:
+        handle = getattr(self, name)
+        if handle is not None:
+            await handle.close()
+        setattr(self, name, None)
+
+    async def _stop_task(self, name: str) -> None:
+        task: Optional[asyncio.Task[None]] = getattr(self, name)
+        if task is not None:
+            _ = task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        setattr(self, name, None)
 
     def _notification_handler(
         self,
@@ -313,7 +322,7 @@ class AsyncpgBroker(AsyncBroker):
         """
         queue = await self._start_consumer()
 
-        while self.write_pool is not None:
+        while self.write_pool is not None and not self._closing:
             try:
                 message_row = await self._dequeue_message()
                 if message_row is None:
@@ -428,6 +437,8 @@ class AsyncpgBroker(AsyncBroker):
         async with self._dequeue_lock:
             try:
                 await self._ensure_connection_healthy()
+                if self.dequeue_conn is None:
+                    return None
                 async with self.dequeue_conn.transaction():
                     return await self._claim_on(self.dequeue_conn)
             except Exception as e:
@@ -440,6 +451,8 @@ class AsyncpgBroker(AsyncBroker):
             return
 
         async with self._connection_lock:
+            if self.dequeue_conn is None or self._closing:
+                return
             try:
                 await self.dequeue_conn.fetchval("SELECT 1")
             except Exception as e:

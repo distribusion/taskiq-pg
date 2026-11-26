@@ -216,6 +216,7 @@ async def _wait_ready(timeout: float, max_retries: int) -> bool:
 
 async def _kick_many(
     producer: AsyncpgBroker,
+    offset: int,
     count: int,
     concurrency: int,
     groups: int,
@@ -240,7 +241,7 @@ async def _kick_many(
             await kicker.kiq()
 
     start = time.monotonic()
-    await asyncio.gather(*(one(i) for i in range(count)))
+    await asyncio.gather(*(one(offset + i) for i in range(count)))
     return time.monotonic() - start
 
 
@@ -255,14 +256,18 @@ async def _count_done(after_id: int) -> int:
 
 async def _produce(producers: list[AsyncpgBroker], args: argparse.Namespace) -> int:
     """Kick ``--rate`` tasks per second from every producer for ``--duration``."""
+    next_index = 0
 
     async def run(producer: AsyncpgBroker) -> int:
+        nonlocal next_index
         kicked = 0
         end = time.monotonic() + args.duration
         while time.monotonic() < end:
             tick = time.monotonic()
+            offset, next_index = next_index, next_index + args.rate
             await _kick_many(
                 producer,
+                offset,
                 args.rate,
                 args.kick_concurrency,
                 args.groups,
@@ -401,9 +406,7 @@ def _print_report(
             f"attempts executed    : {attempts:8d}  "
             f"({attempts / total_elapsed:10.1f} attempts/s)"
         )
-        print(
-            f"retries              : {attempts - tasks:8d}  " f"({dead} dead-lettered)"
-        )
+        print(f"retries              : {attempts - tasks:8d}  ({dead} dead-lettered)")
     if args.groups:
         print(
             f"\nNOTE: --groups {args.groups} caps concurrency at {args.groups} "
@@ -434,12 +437,11 @@ async def _run(args: argparse.Namespace) -> int:
         )
         for _ in range(args.producers)
     ]
-    for producer in producers:
-        await producer.startup()
-
     proc = None
     watcher = None
     try:
+        for producer in producers:
+            await producer.startup()
         proc = await _spawn_worker(
             args.workers, args.max_async_tasks, args.worker_output
         )
@@ -463,17 +465,19 @@ async def _run(args: argparse.Namespace) -> int:
         else:
             shares = [args.count // len(producers)] * len(producers)
             shares[0] += args.count % len(producers)
+            offsets = [sum(shares[:i]) for i in range(len(shares))]
             await asyncio.gather(
                 *(
                     _kick_many(
                         p,
+                        offset,
                         n,
                         args.kick_concurrency,
                         args.groups,
                         args.ordered,
                         args.max_retries,
                     )
-                    for p, n in zip(producers, shares)
+                    for p, offset, n in zip(producers, offsets, shares)
                 )
             )
             tasks = args.count
