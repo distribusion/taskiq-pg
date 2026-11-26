@@ -490,17 +490,18 @@ async def test_dead_row_not_dequeued(asyncpg_broker: AsyncpgBroker) -> None:
 async def test_heartbeat_prevents_reclaim_of_live_claim(
     asyncpg_broker: AsyncpgBroker,
 ) -> None:
-    """Fresh-heartbeat claim survives sweep; a stale one is reclaimed and completes.
+    """Fresh-heartbeat claims survive sweep; a stale one is reclaimed and completes.
 
     Mirrors the bench liveness scenario without a real worker process.
     """
     tbl = asyncpg_broker.table_name
     asyncpg_broker.stuck_message_timeout = 1
-    await asyncpg_broker.kick(
-        BrokerMessage(task_id=uuid.uuid4().hex, task_name="t", message=b"x", labels={})
-    )
+    for _ in range(2):
+        await asyncpg_broker.kick(make_message(asyncpg_broker))
     claimed = await asyncpg_broker._dequeue_message()  # sets active + heartbeat=NOW()
+    fresh = await asyncpg_broker._dequeue_message()
     assert claimed is not None
+    assert fresh is not None
     mid = claimed["id"]
 
     # Fresh lease -> not reclaimed even with a 1s timeout.
@@ -526,6 +527,13 @@ async def test_heartbeat_prevents_reclaim_of_live_claim(
     assert reclaimed is not None
     assert reclaimed["status"] == "queued"
     assert reclaimed["retry_count"] == 1
+    assert (
+        await conn.fetchval(
+            f"SELECT status FROM {tbl} WHERE id = $1",  # noqa: S608
+            fresh["id"],
+        )
+        == "active"
+    )
 
     second = await asyncpg_broker._dequeue_message()
     assert second is not None
