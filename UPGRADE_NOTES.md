@@ -121,6 +121,11 @@ The `AsyncpgBroker` constructor now accepts additional parameters:
 - `stuck_message_timeout`: Time before message is considered stuck (default: 300)
 - `enable_sweeping`: Enable automatic cleanup (default: True)
 - `sweep_interval`: Interval between sweep operations (default: 60)
+- `ensure_schema`: Apply the schema on startup (default: True)
+
+`AsyncpgResultBackend` accepts `ensure_schema` too (default: True). With
+`ensure_schema=False`, startup runs no DDL and the role does not need `CREATE` on the
+schema. Another process must apply the schema, and must deploy first when it changes.
 
 ## Behaviour
 
@@ -159,6 +164,10 @@ deletes expired completed rows. `enable_sweeping=False` stops both.
 
 The broker keeps one connection for dequeuing, separate from the pool, checks its health
 before each claim, and reconnects when it drops.
+
+A broker whose `is_worker_process` is False opens only the write pool on startup. The
+listener, the dequeue connection, the heartbeat and the sweeper start in a worker's
+startup, or on the first `listen()`. A process that only kicks does not sweep.
 
 ## Usage Examples
 

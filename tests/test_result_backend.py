@@ -185,3 +185,46 @@ async def test_success_backend_custom_result_set_same_task_id(
     result = await asyncpg_result_backend.get_result(task_id=task_id)
 
     assert result.return_value["test_arg"] == another_taskiq_res_uuid  # type: ignore
+
+
+async def test_ensure_schema_false_skips_ddl(
+    postgresql_dsn: str,
+    postgres_table: str,
+) -> None:
+    """With ensure_schema=False, startup creates no results table."""
+    backend: AsyncpgResultBackend[object] = AsyncpgResultBackend(
+        dsn=postgresql_dsn,
+        table_name=postgres_table,
+        ensure_schema=False,
+    )
+    await backend.startup()
+    try:
+        assert (
+            await backend._database_pool.fetchval(
+                "SELECT to_regclass($1)", postgres_table
+            )
+            is None
+        )
+    finally:
+        await backend.shutdown()
+
+
+async def test_ensure_schema_false_reads_and_writes_owned_table(
+    asyncpg_result_backend: AsyncpgResultBackend[_ReturnType],
+    default_taskiq_result: TaskiqResult[_ReturnType],
+    task_id: str,
+) -> None:
+    """A backend without DDL works on a table that its owner created."""
+    backend: AsyncpgResultBackend[_ReturnType] = AsyncpgResultBackend(
+        dsn=asyncpg_result_backend.dsn,
+        table_name=asyncpg_result_backend.table_name,
+        ensure_schema=False,
+    )
+    await backend.startup()
+    try:
+        await backend.set_result(task_id=task_id, result=default_taskiq_result)
+        assert await backend.is_result_ready(task_id=task_id)
+        result = await backend.get_result(task_id=task_id)
+        assert result.return_value == default_taskiq_result.return_value
+    finally:
+        await backend.shutdown()

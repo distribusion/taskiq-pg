@@ -42,6 +42,7 @@ class AsyncpgResultBackend(AsyncResultBackend[_ReturnType]):
         table_name: str = "taskiq_results",
         field_for_task_id: Literal["VarChar", "Text"] = "VarChar",
         serializer: Optional[TaskiqSerializer] = None,
+        ensure_schema: bool = True,
         **connect_kwargs: Any,
     ) -> None:
         """Construct new result backend.
@@ -51,6 +52,7 @@ class AsyncpgResultBackend(AsyncResultBackend[_ReturnType]):
         :param table_name: name of the table to store results.
         :param field_for_task_id: type of the field to store task_id.
         :param serializer: serializer class to serialize/deserialize result from task.
+        :param ensure_schema: Create schema objects on startup.
         :param connect_kwargs: additional arguments for asyncpg `create_pool` function.
         """
         self._dsn: Union[
@@ -60,6 +62,7 @@ class AsyncpgResultBackend(AsyncResultBackend[_ReturnType]):
         self.keep_results: Final = keep_results
         self.table_name: Final = table_name
         self.field_for_task_id: Final = field_for_task_id
+        self.ensure_schema: Final = ensure_schema
         self.connect_kwargs: Final = connect_kwargs
         self.serializer = serializer or PickleSerializer()
         self._database_pool: "asyncpg.Pool[Any]"
@@ -89,6 +92,8 @@ class AsyncpgResultBackend(AsyncResultBackend[_ReturnType]):
             raise RuntimeError(msg)
         self._database_pool = _database_pool
 
+        if not self.ensure_schema:
+            return
         _ = await self._database_pool.execute(
             CREATE_TABLE_QUERY.format(
                 self.table_name,

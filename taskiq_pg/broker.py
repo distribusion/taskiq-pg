@@ -55,6 +55,7 @@ class AsyncpgBroker(AsyncBroker):
         enable_sweeping: bool = True,
         sweep_interval: int = 60,  # 1 minute default
         heartbeat_interval: int = 30,  # liveness refresh period, seconds
+        ensure_schema: bool = True,
     ) -> None:
         """
         Construct a new broker.
@@ -73,6 +74,7 @@ class AsyncpgBroker(AsyncBroker):
         :param enable_sweeping: Enable automatic reclamation of stuck messages.
         :param sweep_interval: Interval between sweep operations in seconds.
         :param heartbeat_interval: Interval between liveness refreshes in seconds.
+        :param ensure_schema: Create schema objects on startup.
         """
         super().__init__(
             result_backend=result_backend,
@@ -98,6 +100,7 @@ class AsyncpgBroker(AsyncBroker):
         self.enable_sweeping: bool = enable_sweeping
         self.sweep_interval: int = sweep_interval
         self.heartbeat_interval: int = heartbeat_interval
+        self.ensure_schema: bool = ensure_schema
         self.claim_fn: str = schema.claim_fn_name(table_name)
 
         self.read_conn: Optional["asyncpg.Connection[asyncpg.Record]"] = None
@@ -148,49 +151,70 @@ class AsyncpgBroker(AsyncBroker):
     @override
     async def startup(self) -> None:
         """Initialize the broker."""
-        await super().startup()
+        try:
+            await super().startup()
 
-        self.read_conn = await asyncpg.connect(self.dsn, **self.connection_kwargs)
-        self.dequeue_conn = await asyncpg.connect(self.dsn, **self.connection_kwargs)
-        self.write_pool = await asyncpg.create_pool(self.dsn, **self.pool_kwargs)
+            self.write_pool = await asyncpg.create_pool(self.dsn, **self.pool_kwargs)
+            if self.write_pool is None:
+                msg = "write_pool not initialized"
+                raise RuntimeError(msg)
 
-        if self.read_conn is None:
-            msg = "read_conn not initialized"
-            raise RuntimeError(msg)
-        if self.dequeue_conn is None:
-            msg = "dequeue_conn not initialized"
-            raise RuntimeError(msg)
-        if self.write_pool is None:
-            msg = "write_pool not initialized"
-            raise RuntimeError(msg)
+            if self.ensure_schema:
+                async with self.write_pool.acquire() as conn:
+                    await schema.ensure(conn, self.table_name, self.job_lock_keyspace)
 
-        async with self.write_pool.acquire() as conn:
-            await schema.ensure(conn, self.table_name, self.job_lock_keyspace)
+            if self.is_worker_process:
+                await self._start_consumer()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.shutdown()
+            raise
 
-        await self.read_conn.add_listener(self.channel_name, self._notification_handler)
-        self._queue = asyncio.Queue()
-
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        if self.enable_sweeping:
-            self._sweep_task = asyncio.create_task(self._sweep_loop())
+    async def _start_consumer(self) -> asyncio.Queue[str]:
+        """Open listener and dequeue connections, and start worker tasks."""
+        async with self._connection_lock:
+            if self.write_pool is None:
+                raise ValueError("Call startup before starting listening.")
+            if self._queue is not None:
+                return self._queue
+            async with contextlib.AsyncExitStack() as stack:
+                read_conn = await asyncpg.connect(self.dsn, **self.connection_kwargs)
+                stack.push_async_callback(read_conn.close)
+                dequeue_conn = await asyncpg.connect(self.dsn, **self.connection_kwargs)
+                stack.push_async_callback(dequeue_conn.close)
+                queue: asyncio.Queue[str] = asyncio.Queue()
+                self._queue = queue
+                stack.callback(setattr, self, "_queue", None)
+                await read_conn.add_listener(
+                    self.channel_name, self._notification_handler
+                )
+                if self.write_pool is None:
+                    raise ValueError("Broker shut down during listen startup.")
+                stack.pop_all()
+            self.read_conn = read_conn
+            self.dequeue_conn = dequeue_conn
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            if self.enable_sweeping:
+                self._sweep_task = asyncio.create_task(self._sweep_loop())
+            return queue
 
     @override
     async def shutdown(self) -> None:
         """Close all connections on shutdown."""
-        await super().shutdown()
-
-        for task in (self._sweep_task, self._heartbeat_task):
-            if task is not None:
-                _ = task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
-        if self.read_conn is not None:
-            await self.read_conn.close()
-        if self.dequeue_conn is not None:
-            await self.dequeue_conn.close()
-        if self.write_pool is not None:
-            await self.write_pool.close()
+        try:
+            await super().shutdown()
+            for task in (self._sweep_task, self._heartbeat_task):
+                if task is not None:
+                    _ = task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            for resource in (self.read_conn, self.dequeue_conn, self.write_pool):
+                if resource is not None:
+                    await resource.close()
+        finally:
+            self.read_conn = self.dequeue_conn = self.write_pool = None
+            self._queue = self._sweep_task = self._heartbeat_task = None
+            self._inflight_ids.clear()
 
     def _notification_handler(
         self,
@@ -279,7 +303,7 @@ class AsyncpgBroker(AsyncBroker):
             _ = await conn.execute(f"NOTIFY {self.channel_name}, '{message_id}'")
 
     @override
-    async def listen(self) -> AsyncGenerator[AckableMessage, None]:  # noqa: C901
+    async def listen(self) -> AsyncGenerator[AckableMessage, None]:
         """
         Listen to the channel.
 
@@ -287,21 +311,15 @@ class AsyncpgBroker(AsyncBroker):
 
         :yields: AckableMessage instances.
         """
-        if self.dequeue_conn is None:
-            raise ValueError("Call startup before starting listening.")
-        if self._queue is None:
-            raise ValueError("Startup did not initialize the queue.")
+        queue = await self._start_consumer()
 
-        while True:
+        while self.write_pool is not None:
             try:
                 message_row = await self._dequeue_message()
-
                 if message_row is None:
-                    try:
-                        _ = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-                        message_row = await self._dequeue_message()
-                    except asyncio.TimeoutError:
-                        message_row = await self._dequeue_message()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        _ = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    message_row = await self._dequeue_message()
 
                 if message_row is None:
                     continue

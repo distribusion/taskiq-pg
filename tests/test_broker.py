@@ -1062,3 +1062,101 @@ async def test_job_lock_keyspace_validation(postgresql_dsn: str) -> None:
         AsyncpgBroker(dsn=postgresql_dsn, job_lock_keyspace="1")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="signed 64-bit"):
         AsyncpgBroker(dsn=postgresql_dsn, job_lock_keyspace=2**63)
+
+
+@pytest.mark.anyio
+async def test_producer_startup_skips_consumer_setup(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """A non-worker broker opens only the write pool, and its kicks reach a worker."""
+    producer = AsyncpgBroker(
+        dsn=asyncpg_broker.dsn,
+        channel_name=asyncpg_broker.channel_name,
+        table_name=asyncpg_broker.table_name,
+        job_lock_keyspace=asyncpg_broker.job_lock_keyspace,
+        ensure_schema=False,
+    )
+    await producer.startup()
+    try:
+        assert producer.write_pool is not None
+        assert producer.read_conn is None
+        assert producer.dequeue_conn is None
+        assert producer._queue is None
+        assert producer._heartbeat_task is None
+        assert producer._sweep_task is None
+
+        sent = make_message(producer)
+        await producer.kick(sent)
+        message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+        assert asyncpg_broker.formatter.loads(message.data).task_id == sent.task_id
+        await maybe_awaitable(message.ack())
+    finally:
+        await producer.shutdown()
+
+
+@pytest.mark.anyio
+async def test_listen_starts_consumer_after_producer_startup(
+    asyncpg_broker: AsyncpgBroker,
+) -> None:
+    """listen() after a non-worker startup works, as with run_receiver_task."""
+    late = AsyncpgBroker(
+        dsn=asyncpg_broker.dsn,
+        channel_name=asyncpg_broker.channel_name,
+        table_name=asyncpg_broker.table_name,
+        job_lock_keyspace=asyncpg_broker.job_lock_keyspace,
+        enable_sweeping=False,
+    )
+    await late.startup()
+    try:
+        listener = asyncio.create_task(get_first_task(late))
+        while late.read_conn is None and not listener.done():
+            await asyncio.sleep(0.01)
+        async with late._dequeue_lock:
+            pass
+        sent = make_message(late)
+        await late.kick(sent)
+        message = await asyncio.wait_for(listener, timeout=0.5)
+        assert late.formatter.loads(message.data).task_id == sent.task_id
+        await maybe_awaitable(message.ack())
+        assert late.read_conn is not None
+        assert late._heartbeat_task is not None
+    finally:
+        await late.shutdown()
+
+    assert late.write_pool is None
+    assert late.read_conn is None
+    assert late.dequeue_conn is None
+    assert late._queue is None
+    assert late._heartbeat_task is None
+
+    await late.startup()
+    try:
+        assert late.read_conn is None
+    finally:
+        await late.shutdown()
+
+
+@pytest.mark.anyio
+async def test_ensure_schema_false_skips_ddl(
+    postgresql_dsn: str,
+    postgres_table: str,
+) -> None:
+    """With ensure_schema=False, startup creates no table and no claim function."""
+    broker = AsyncpgBroker(
+        dsn=postgresql_dsn,
+        table_name=postgres_table,
+        ensure_schema=False,
+    )
+    await broker.startup()
+    try:
+        assert broker.write_pool is not None
+        assert (
+            await broker.write_pool.fetchval("SELECT to_regclass($1)", postgres_table)
+            is None
+        )
+        assert (
+            await broker.write_pool.fetchval("SELECT to_regproc($1)", broker.claim_fn)
+            is None
+        )
+    finally:
+        await broker.shutdown()
