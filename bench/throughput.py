@@ -30,12 +30,18 @@ price the head-of-line predicate.
 ``OrderedRetryMiddleware``, so failures requeue the same row instead of kicking a
 new one. Compare against ``--fail-rate 0`` at the same ``-n`` to price retries;
 the report separates messages drained from attempts executed.
+
+``--producers N`` kicks from N separate non-worker brokers. ``--duration S`` kicks
+``--rate`` tasks per second from each of them for S seconds instead of ``-n``, for a
+soak. Throughout, the report tracks the longest time work was outstanding with no
+completion; a stall over ``--stall-timeout`` exits 1.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import random
 import signal
@@ -66,6 +72,7 @@ broker = AsyncpgBroker(
     dsn=DSN,
     channel_name=CHANNEL,
     table_name=TABLE,
+    message_ttl=365 * 86400,
     connection_kwargs={"server_settings": {"application_name": "bench_worker"}},
     pool_kwargs={"server_settings": {"application_name": "bench_worker"}},
 )
@@ -107,7 +114,8 @@ async def _count_rows() -> int:
     # Outstanding work = not yet terminal. This broker soft-completes (marks
     # status='completed' for TTL) instead of deleting; 'dead' is terminal too.
     value = await broker.write_pool.fetchval(
-        f"SELECT count(*) FROM {TABLE} WHERE status NOT IN ('completed', 'dead')"
+        f"SELECT (SELECT count(*) FROM {TABLE} WHERE status = 'queued') "
+        f"+ (SELECT count(*) FROM {TABLE} WHERE status = 'active')"
     )
     return int(value or 0)
 
@@ -209,7 +217,13 @@ async def _wait_ready(timeout: float, max_retries: int) -> bool:
 
 
 async def _kick_many(
-    count: int, concurrency: int, groups: int, ordered: bool, max_retries: int
+    producer: AsyncpgBroker,
+    offset: int,
+    count: int,
+    concurrency: int,
+    groups: int,
+    ordered: bool,
+    max_retries: int,
 ) -> float:
     sem = asyncio.Semaphore(concurrency)
 
@@ -217,7 +231,11 @@ async def _kick_many(
         async with sem:
             # Set here, not from the decorator: the driver imported this module
             # before --max-retries was parsed, so its task labels are stale.
-            kicker = bench_task.kicker().with_labels(max_retries=max_retries)
+            kicker = (
+                bench_task.kicker()
+                .with_broker(producer)
+                .with_labels(max_retries=max_retries)
+            )
             if groups:
                 kicker = kicker.with_labels(
                     group_key=f"g{index % groups}", ordered=ordered
@@ -225,12 +243,85 @@ async def _kick_many(
             await kicker.kiq()
 
     start = time.monotonic()
-    await asyncio.gather(*(one(i) for i in range(count)))
+    await asyncio.gather(*(one(offset + i) for i in range(count)))
     return time.monotonic() - start
 
 
-async def _drain(drain_timeout: float, stall_timeout: float) -> float:
-    """Poll until the table is empty, returning processing wall-time.
+async def _completion_mark() -> tuple[object, int]:
+    row = await broker.write_pool.fetchrow(
+        f"SELECT (SELECT max(expire_at) FROM {TABLE} WHERE expire_at IS NOT NULL) "
+        f"AS done, (SELECT count(*) FROM {TABLE} WHERE status = 'dead') AS dead"
+    )
+    return row["done"], row["dead"]
+
+
+async def _produce(producers: list[AsyncpgBroker], args: argparse.Namespace) -> int:
+    """Kick ``--rate`` tasks per second from every producer for ``--duration``."""
+    next_index = 0
+
+    async def run(producer: AsyncpgBroker) -> int:
+        nonlocal next_index
+        kicked = 0
+        end = time.monotonic() + args.duration
+        while time.monotonic() < end:
+            tick = time.monotonic()
+            offset, next_index = next_index, next_index + args.rate
+            await _kick_many(
+                producer,
+                offset,
+                args.rate,
+                args.kick_concurrency,
+                args.groups,
+                args.ordered,
+                args.max_retries,
+            )
+            kicked += args.rate
+            await asyncio.sleep(max(0.0, 1.0 - (time.monotonic() - tick)))
+        return kicked
+
+    return sum(await asyncio.gather(*(run(p) for p in producers)))
+
+
+class _StallWatch:
+    """Track the longest time work was outstanding while nothing completed.
+
+    Progress: a newer expire_at, a new dead row, or fewer outstanding rows.
+    """
+
+    def __init__(self, stall_timeout: float) -> None:
+        self.stall_timeout = stall_timeout
+        self.longest = 0.0
+        self.stalls = 0
+
+    async def run(self) -> None:
+        last_mark = await _completion_mark()
+        last_left = await _count_rows()
+        last_progress = time.monotonic()
+        stalled = False
+        while True:
+            await asyncio.sleep(0.1)
+            mark = await _completion_mark()
+            left = await _count_rows()
+            now = time.monotonic()
+            if left:
+                self.longest = max(self.longest, now - last_progress)
+            progressed = mark != last_mark or left < last_left or not left
+            last_mark, last_left = mark, left
+            if progressed:
+                last_progress, stalled = now, False
+                continue
+            if not stalled and now - last_progress > self.stall_timeout:
+                stalled = True
+                self.stalls += 1
+                print(
+                    f"  stall: no completion for {self.stall_timeout:.0f}s; "
+                    f"{await _stuck_breakdown()}",
+                    file=sys.stderr,
+                )
+
+
+async def _drain(drain_timeout: float, stall_timeout: float) -> bool:
+    """Poll until the table is empty; return whether stalled rows needed a re-NOTIFY.
 
     Re-NOTIFYs remaining rows if no progress is made within ``stall_timeout``.
     """
@@ -248,7 +339,7 @@ async def _drain(drain_timeout: float, stall_timeout: float) -> float:
                     "  WARNING: had to re-NOTIFY stalled rows; numbers are unreliable",
                     file=sys.stderr,
                 )
-            return time.monotonic() - start
+            return recovered
 
         now = time.monotonic()
         if remaining < last_count:
@@ -284,14 +375,22 @@ async def _teardown_worker(proc: asyncio.subprocess.Process) -> None:
 
 
 def _print_report(
-    args: argparse.Namespace, total_elapsed: float, attempts: int, dead: int
+    args: argparse.Namespace,
+    tasks: int,
+    total_elapsed: float,
+    attempts: int,
+    dead: int,
+    watch: _StallWatch,
 ) -> None:
     if args.groups:
         mode = f"{args.groups} groups, {'ordered' if args.ordered else 'mutex only'}"
     else:
         mode = "ungrouped"
     print("\n=== throughput report ===")
-    print(f"tasks                : {args.count}")
+    print(f"tasks                : {tasks}")
+    print(f"producers            : {args.producers}")
+    if args.duration:
+        print(f"duration             : {args.duration:.0f}s at {args.rate}/s each")
     print(f"workers              : {args.workers}")
     print(f"max_async_tasks      : {args.max_async_tasks}")
     print(f"mode                 : {mode}")
@@ -304,17 +403,18 @@ def _print_report(
     print("-")
     print(
         f"end-to-end           : {total_elapsed:8.3f}s  "
-        f"({args.count / total_elapsed:10.1f} tasks/s)"
+        f"({tasks / total_elapsed:10.1f} tasks/s)"
+    )
+    print(
+        f"longest stall        : {watch.longest:8.3f}s  "
+        f"({watch.stalls} over {args.stall_timeout:.0f}s)"
     )
     if args.fail_rate:
         print(
             f"attempts executed    : {attempts:8d}  "
             f"({attempts / total_elapsed:10.1f} attempts/s)"
         )
-        print(
-            f"retries              : {attempts - args.count:8d}  "
-            f"({dead} dead-lettered)"
-        )
+        print(f"retries              : {attempts - tasks:8d}  ({dead} dead-lettered)")
     if args.groups:
         print(
             f"\nNOTE: --groups {args.groups} caps concurrency at {args.groups} "
@@ -335,12 +435,24 @@ async def _run(args: argparse.Namespace) -> int:
     os.environ["BENCH_RETRY_DELAY"] = str(args.retry_delay)
 
     await broker.startup()
-    # The driver only enqueues + polls, so drop its listener.
-    if broker.read_conn is not None:
-        await broker.read_conn.remove_listener(CHANNEL, broker._notification_handler)
-
+    producers = [
+        AsyncpgBroker(
+            dsn=DSN,
+            channel_name=CHANNEL,
+            table_name=TABLE,
+            ensure_schema=False,
+            pool_kwargs={"server_settings": {"application_name": "bench_producer"}},
+        )
+        for _ in range(args.producers)
+    ]
     proc = None
+    watcher = None
     try:
+        await broker.write_pool.execute(
+            f"CREATE INDEX ON {TABLE} (id) WHERE status = 'dead'"
+        )
+        for producer in producers:
+            await producer.startup()
         proc = await _spawn_worker(
             args.workers, args.max_async_tasks, args.worker_output
         )
@@ -356,28 +468,59 @@ async def _run(args: argparse.Namespace) -> int:
                 f"SELECT coalesce(max(id), 0) FROM {TABLE}"
             )
         )
+        watch = _StallWatch(args.stall_timeout)
+        watcher = asyncio.create_task(watch.run())
         kick_start = time.monotonic()
-        await _kick_many(
-            args.count,
-            args.kick_concurrency,
-            args.groups,
-            args.ordered,
-            args.max_retries,
-        )
-        await _drain(args.drain_timeout, args.stall_timeout)
+        if args.duration:
+            tasks = await _produce(producers, args)
+        else:
+            shares = [args.count // len(producers)] * len(producers)
+            shares[0] += args.count % len(producers)
+            offsets = [sum(shares[:i]) for i in range(len(shares))]
+            await asyncio.gather(
+                *(
+                    _kick_many(
+                        p,
+                        offset,
+                        n,
+                        args.kick_concurrency,
+                        args.groups,
+                        args.ordered,
+                        args.max_retries,
+                    )
+                    for p, offset, n in zip(producers, offsets, shares)
+                )
+            )
+            tasks = args.count
+        recovered = await _drain(args.drain_timeout, args.stall_timeout)
         total_elapsed = time.monotonic() - kick_start
 
         attempts, dead = await _attempt_stats(last_setup_id)
-        _print_report(args, total_elapsed, attempts, dead)
-        return 0
+        _print_report(args, tasks, total_elapsed, attempts, dead, watch)
+        return 1 if watch.stalls or recovered else 0
     finally:
-        if proc is not None:
-            await _teardown_worker(proc)
-        await broker.write_pool.execute(f"DROP TABLE IF EXISTS {TABLE}")
-        await broker.write_pool.execute(
-            f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
-        )
-        await broker.shutdown()
+        async with contextlib.AsyncExitStack() as stack:
+            stack.push_async_callback(broker.shutdown)
+            stack.push_async_callback(_drop_bench_table)
+            if proc is not None:
+                stack.push_async_callback(_teardown_worker, proc)
+            for producer in producers:
+                stack.push_async_callback(producer.shutdown)
+            if watcher is not None:
+                stack.push_async_callback(_stop_watcher, watcher)
+
+
+async def _stop_watcher(watcher: asyncio.Task[None]) -> None:
+    watcher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await watcher
+
+
+async def _drop_bench_table() -> None:
+    await broker.write_pool.execute(f"DROP TABLE IF EXISTS {TABLE}")
+    await broker.write_pool.execute(
+        f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -387,6 +530,22 @@ def _parse_args() -> argparse.Namespace:
         "env vars; see module docstring."
     )
     parser.add_argument("-n", "--count", type=int, default=5000)
+    parser.add_argument(
+        "-p",
+        "--producers",
+        type=int,
+        default=1,
+        help="producer brokers kicking concurrently, each with its own pool",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=0.0,
+        help="kick for this many seconds at --rate per producer, instead of -n",
+    )
+    parser.add_argument(
+        "--rate", type=int, default=100, help="tasks/s per producer with --duration"
+    )
     parser.add_argument("-w", "--workers", type=int, default=1)
     parser.add_argument("-m", "--max-async-tasks", type=int, default=100)
     parser.add_argument("--busy-seconds", type=float, default=BUSY_SECONDS)
@@ -428,6 +587,12 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.ordered and not args.groups:
         parser.error("--ordered requires --groups")
+    if args.producers < 1:
+        parser.error("--producers must be at least 1")
+    if args.duration < 0:
+        parser.error("--duration must not be negative")
+    if args.duration and args.rate < 1:
+        parser.error("--rate must be at least 1 with --duration")
     return args
 
 

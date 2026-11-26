@@ -16,6 +16,8 @@
 * Add dedicated dequeue connection for improved performance
 * Implement `FOR UPDATE SKIP LOCKED` for efficient concurrent dequeuing
 * Add configurable sweep interval and stuck message timeout
+* Add `ensure_schema` to `AsyncpgBroker` and `AsyncpgResultBackend`, so a process that does not own the schema runs no DDL on startup
+* Open only the write pool in a non-worker broker's startup: the listener, dequeue connection, heartbeat and sweeper start in a worker's startup, or on the first `listen()`
 
 ### Breaking Changes
 

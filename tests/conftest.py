@@ -85,6 +85,7 @@ async def asyncpg_broker(
         job_lock_keyspace=job_lock_keyspace,
         enable_sweeping=False,  # Disable sweeping in tests to avoid conflicts
     )
+    broker.is_worker_process = True
     await broker.startup()
     yield broker
     assert broker.write_pool

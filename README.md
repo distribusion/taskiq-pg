@@ -127,6 +127,7 @@ select convert_from(result, 'UTF8') from taskiq_results;
 - `keep_results`: keep a result in the table after it is read instead of deleting it.
 - `table_name`: name of the table in PostgreSQL to store TaskIQ results.
 - `field_for_task_id`: type of a field for `task_id`, you may need it if you want to have length of task_id more than 255 symbols.
+- `ensure_schema`: create the table and index on startup (default: True). Set False when another process owns the schema.
 - `**connect_kwargs`: additional connection parameters, you can read more about it in [asyncpg](https://github.com/MagicStack/asyncpg) repository.
 
 ## AsyncpgBroker configuration
@@ -144,6 +145,9 @@ select convert_from(result, 'UTF8') from taskiq_results;
 - `stuck_message_timeout`: Time before message is considered stuck in seconds (default: 300).
 - `enable_sweeping`: Enable automatic cleanup of stuck messages (default: True).
 - `sweep_interval`: Interval between sweep operations in seconds (default: 60).
+- `ensure_schema`: Apply the schema on startup (default: True). Set False when another process owns the schema.
+
+A broker that is not a worker process (`is_worker_process` is False, as in a web app that only kicks tasks) opens only the write pool on startup. The listener, dequeue connection, heartbeat and sweeper start in a worker's startup, or on the first `listen()`.
 
 ## Features
 
@@ -228,6 +232,8 @@ export POSTGRESQL_URL="postgresql://postgres:postgres@localhost:25432/postgres"
 # 5000 tasks, 1 worker, up to 100 concurrent async tasks
 uv run python -m bench.throughput -n 5000 -w 1 -m 100
 # tune per-task cost (seconds): uv run python -m bench.throughput --busy-seconds 0.002 --sleep-seconds 0.01
+# soak: 4 producers at 100 tasks/s each for 5 minutes, 4 worker processes; exits 1 on a stall
+uv run python -m bench.throughput -p 4 -w 4 --duration 300 --rate 100
 
 bin/pg-down
 ```
