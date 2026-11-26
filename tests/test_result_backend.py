@@ -159,22 +159,12 @@ async def test_success_backend_is_result_ready(
     assert await asyncpg_result_backend.is_result_ready(task_id=task_id)
 
 
-async def test_test_success_backend_custom_result_set_same_task_id(
+async def test_success_backend_custom_result_set_same_task_id(
     asyncpg_result_backend: AsyncpgResultBackend[_ReturnType],
     custom_taskiq_result: TaskiqResult[_ReturnType],
     task_id: str,
 ) -> None:
-    await asyncpg_result_backend.set_result(
-        task_id=task_id,
-        result=custom_taskiq_result,
-    )
-    result = await asyncpg_result_backend.get_result(task_id=task_id)
-
-    assert (
-        result.return_value["test_arg"]  # type: ignore
-        == custom_taskiq_result.return_value.test_arg  # type: ignore
-    )
-
+    """A second set_result for the same task_id replaces the first."""
     await asyncpg_result_backend.set_result(
         task_id=task_id,
         result=custom_taskiq_result,
