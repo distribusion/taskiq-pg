@@ -298,10 +298,12 @@ class _StallWatch:
             await asyncio.sleep(0.1)
             done = await _count_done(self.after_id)
             now = time.monotonic()
-            if done > last_done or await _count_rows() == 0:
+            idle = await _count_rows() == 0
+            if not idle:
+                self.longest = max(self.longest, now - last_progress)
+            if done > last_done or idle:
                 last_done, last_progress, stalled = done, now, False
                 continue
-            self.longest = max(self.longest, now - last_progress)
             if not stalled and now - last_progress > self.stall_timeout:
                 stalled = True
                 self.stalls += 1
@@ -312,8 +314,8 @@ class _StallWatch:
                 )
 
 
-async def _drain(drain_timeout: float, stall_timeout: float) -> float:
-    """Poll until the table is empty, returning processing wall-time.
+async def _drain(drain_timeout: float, stall_timeout: float) -> bool:
+    """Poll until the table is empty; return whether stalled rows needed a re-NOTIFY.
 
     Re-NOTIFYs remaining rows if no progress is made within ``stall_timeout``.
     """
@@ -331,7 +333,7 @@ async def _drain(drain_timeout: float, stall_timeout: float) -> float:
                     "  WARNING: had to re-NOTIFY stalled rows; numbers are unreliable",
                     file=sys.stderr,
                 )
-            return time.monotonic() - start
+            return recovered
 
         now = time.monotonic()
         if remaining < last_count:
@@ -481,26 +483,35 @@ async def _run(args: argparse.Namespace) -> int:
                 )
             )
             tasks = args.count
-        await _drain(args.drain_timeout, args.stall_timeout)
+        recovered = await _drain(args.drain_timeout, args.stall_timeout)
         total_elapsed = time.monotonic() - kick_start
 
         attempts, dead = await _attempt_stats(last_setup_id)
         _print_report(args, tasks, total_elapsed, attempts, dead, watch)
-        return 1 if watch.stalls else 0
+        return 1 if watch.stalls or recovered else 0
     finally:
-        if watcher is not None:
-            watcher.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await watcher
-        for producer in producers:
-            await producer.shutdown()
-        if proc is not None:
-            await _teardown_worker(proc)
-        await broker.write_pool.execute(f"DROP TABLE IF EXISTS {TABLE}")
-        await broker.write_pool.execute(
-            f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
-        )
-        await broker.shutdown()
+        async with contextlib.AsyncExitStack() as stack:
+            stack.push_async_callback(broker.shutdown)
+            stack.push_async_callback(_drop_bench_table)
+            if proc is not None:
+                stack.push_async_callback(_teardown_worker, proc)
+            for producer in producers:
+                stack.push_async_callback(producer.shutdown)
+            if watcher is not None:
+                stack.push_async_callback(_stop_watcher, watcher)
+
+
+async def _stop_watcher(watcher: asyncio.Task[None]) -> None:
+    watcher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await watcher
+
+
+async def _drop_bench_table() -> None:
+    await broker.write_pool.execute(f"DROP TABLE IF EXISTS {TABLE}")
+    await broker.write_pool.execute(
+        f"DROP FUNCTION IF EXISTS {broker.claim_fn}(BIGINT)"
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -569,6 +580,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--ordered requires --groups")
     if args.producers < 1:
         parser.error("--producers must be at least 1")
+    if args.duration < 0:
+        parser.error("--duration must not be negative")
+    if args.duration and args.rate < 1:
+        parser.error("--rate must be at least 1 with --duration")
     return args
 
 
