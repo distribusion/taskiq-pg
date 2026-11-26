@@ -72,6 +72,7 @@ broker = AsyncpgBroker(
     dsn=DSN,
     channel_name=CHANNEL,
     table_name=TABLE,
+    message_ttl=365 * 86400,
     connection_kwargs={"server_settings": {"application_name": "bench_worker"}},
     pool_kwargs={"server_settings": {"application_name": "bench_worker"}},
 )
