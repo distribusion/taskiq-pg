@@ -114,7 +114,8 @@ async def _count_rows() -> int:
     # Outstanding work = not yet terminal. This broker soft-completes (marks
     # status='completed' for TTL) instead of deleting; 'dead' is terminal too.
     value = await broker.write_pool.fetchval(
-        f"SELECT count(*) FROM {TABLE} WHERE status NOT IN ('completed', 'dead')"
+        f"SELECT (SELECT count(*) FROM {TABLE} WHERE status = 'queued') "
+        f"+ (SELECT count(*) FROM {TABLE} WHERE status = 'active')"
     )
     return int(value or 0)
 
@@ -246,13 +247,10 @@ async def _kick_many(
     return time.monotonic() - start
 
 
-async def _count_done(after_id: int) -> int:
-    value = await broker.write_pool.fetchval(
-        f"SELECT count(*) FROM {TABLE} "
-        f"WHERE id > $1 AND status IN ('completed', 'dead')",
-        after_id,
+async def _last_completion() -> object:
+    return await broker.write_pool.fetchval(
+        f"SELECT max(expire_at) FROM {TABLE} WHERE expire_at IS NOT NULL"
     )
-    return int(value or 0)
 
 
 async def _produce(producers: list[AsyncpgBroker], args: argparse.Namespace) -> int:
@@ -283,27 +281,32 @@ async def _produce(producers: list[AsyncpgBroker], args: argparse.Namespace) -> 
 
 
 class _StallWatch:
-    """Track the longest time work was outstanding while nothing completed."""
+    """Track the longest time work was outstanding while nothing completed.
 
-    def __init__(self, after_id: int, stall_timeout: float) -> None:
-        self.after_id = after_id
+    Progress: a newer expire_at, or fewer outstanding rows (covers dead-lettering).
+    """
+
+    def __init__(self, stall_timeout: float) -> None:
         self.stall_timeout = stall_timeout
         self.longest = 0.0
         self.stalls = 0
 
     async def run(self) -> None:
-        last_done = await _count_done(self.after_id)
+        last_mark = await _last_completion()
+        last_left = await _count_rows()
         last_progress = time.monotonic()
         stalled = False
         while True:
             await asyncio.sleep(0.1)
-            done = await _count_done(self.after_id)
+            mark = await _last_completion()
+            left = await _count_rows()
             now = time.monotonic()
-            idle = await _count_rows() == 0
-            if not idle:
+            if left:
                 self.longest = max(self.longest, now - last_progress)
-            if done > last_done or idle:
-                last_done, last_progress, stalled = done, now, False
+            progressed = mark != last_mark or left < last_left or not left
+            last_mark, last_left = mark, left
+            if progressed:
+                last_progress, stalled = now, False
                 continue
             if not stalled and now - last_progress > self.stall_timeout:
                 stalled = True
@@ -460,7 +463,7 @@ async def _run(args: argparse.Namespace) -> int:
                 f"SELECT coalesce(max(id), 0) FROM {TABLE}"
             )
         )
-        watch = _StallWatch(last_setup_id, args.stall_timeout)
+        watch = _StallWatch(args.stall_timeout)
         watcher = asyncio.create_task(watch.run())
         kick_start = time.monotonic()
         if args.duration:
